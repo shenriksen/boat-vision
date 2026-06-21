@@ -1,0 +1,20 @@
+# Dataset definition for future custom training.
+# Put images and YOLO-format labels under data/datasets/maritime.
+
+path: ../data/datasets/maritime
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: boat
+  1: ship
+  2: sailboat
+  3: small_vessel
+  4: navigation_buoy
+  5: red_lateral_mark
+  6: green_lateral_mark
+  7: cardinal_mark
+  8: special_mark
+  9: floating_object
+  10: person

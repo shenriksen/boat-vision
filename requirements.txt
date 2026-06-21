@@ -1,0 +1,9 @@
+# Boat Vision dependencies.
+# On Windows, run scripts/setup_windows.ps1 — it installs the correct CUDA (GPU)
+# build of PyTorch first, then these. Installing this file directly will let
+# ultralytics pull a default (often CPU-only) PyTorch.
+ultralytics
+opencv-python
+PyYAML
+torch
+torchvision

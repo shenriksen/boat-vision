@@ -1,0 +1,89 @@
+app:
+  host: 0.0.0.0
+  port: 8765
+  model: yolo26n.pt
+  confidence_threshold: 0.35
+  iou_threshold: 0.45
+  image_size: 640
+  device: mps
+  output_jsonl: outputs/events/preview_dashboard_detections.jsonl
+  jpeg_quality: 80
+  demo_findings: false
+dashboard:
+  columns: '2'
+  show_events: false
+  card_min_width: 420
+  view_mode: workspace
+cameras:
+- camera_id: bow_camera
+  name: Bow Camera
+  source: .context/attachments/K1UtgY/IMG_5139.MOV
+  enabled: true
+  allowed_classes:
+  - boat
+  - ship
+  - sailboat
+  - small_vessel
+  - navigation_buoy
+  - red_lateral_mark
+  - green_lateral_mark
+  - cardinal_mark
+  - special_mark
+  - floating_object
+  - person
+  ignore_zones:
+  - x1: 0.14
+    y1: 0.4
+    x2: 0.34
+    y2: 0.5
+- camera_id: stern_camera
+  name: Stern Camera
+  source: .context/attachments/muXYbD/IMG_5140.MOV
+  enabled: true
+  allowed_classes:
+  - boat
+  - ship
+  - sailboat
+  - small_vessel
+  - navigation_buoy
+  - red_lateral_mark
+  - green_lateral_mark
+  - cardinal_mark
+  - special_mark
+  - floating_object
+  - person
+  ignore_zones: []
+- camera_id: port_camera
+  name: Port Camera
+  source: .context/attachments/RsHfAA/IMG_5141.MOV
+  enabled: true
+  allowed_classes:
+  - boat
+  - ship
+  - sailboat
+  - small_vessel
+  - navigation_buoy
+  - red_lateral_mark
+  - green_lateral_mark
+  - cardinal_mark
+  - special_mark
+  - floating_object
+  - person
+  ignore_zones: []
+- camera_id: starboard_camera
+  name: Starboard Camera
+  source: .context/attachments/hhpvfi/IMG_5142.MOV
+  enabled: true
+  allowed_classes:
+  - boat
+  - ship
+  - sailboat
+  - small_vessel
+  - navigation_buoy
+  - red_lateral_mark
+  - green_lateral_mark
+  - cardinal_mark
+  - special_mark
+  - floating_object
+  - person
+  ignore_zones: []

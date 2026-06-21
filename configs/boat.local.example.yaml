@@ -1,0 +1,31 @@
+# Copy this to configs/boat.local.yaml and fill in real camera URLs on the
+# Windows deployment PC. configs/*.local.yaml is gitignored.
+
+model: yolo26n.pt
+source: rtsp://username:password@192.168.x.x:554/stream1
+source_fps:
+camera_id: bow_camera
+
+confidence_threshold: 0.35
+iou_threshold: 0.45
+image_size: 640
+frame_stride: 1
+max_frames:
+
+# Set to [] when using a custom maritime model that outputs your own classes.
+allowed_classes:
+  - boat
+  - person
+
+output_jsonl: outputs/events/bow_camera_detections.jsonl
+append_events: true
+
+save_annotated_video: false
+annotated_video_path: outputs/annotated/bow_camera_annotated.mp4
+annotated_video_fps: 15
+display: false
+stream_buffer: false
+
+# Windows NVIDIA GPU: 0
+# CPU fallback: cpu
+device:

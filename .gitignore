@@ -1,0 +1,9 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+data/
+outputs/
+BoatVision.exe
+configs/*.local.yaml

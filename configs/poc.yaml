@@ -1,0 +1,39 @@
+# Local proof-of-concept configuration.
+# Start with a recorded MP4 on your MacBook, then replace source with an RTSP URL
+# on the Windows deployment machine.
+
+model: yolo26n.pt
+source: data/videos/sample.mp4
+source_fps:
+camera_id: bow_camera
+
+confidence_threshold: 0.25
+iou_threshold: 0.45
+image_size: 640
+frame_stride: 1
+max_frames:
+
+# For the generic pretrained COCO model, "boat" and "person" are the useful
+# maritime-adjacent classes. Set to [] to emit every detected class while testing.
+allowed_classes:
+  - boat
+  - person
+
+output_jsonl: outputs/events/poc_detections.jsonl
+append_events: false
+
+save_annotated_video: true
+annotated_video_path: outputs/annotated/poc_annotated.mp4
+annotated_video_fps: 15
+display: false
+
+# Keep false for live RTSP. When false, stale stream frames may be dropped so
+# inference stays close to real time instead of building latency.
+stream_buffer: false
+
+# Examples:
+#   Mac Apple Silicon: mps
+#   Windows NVIDIA GPU: 0
+#   CPU fallback: cpu
+#   Auto/default: leave blank
+device:

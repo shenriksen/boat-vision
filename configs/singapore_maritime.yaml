@@ -1,0 +1,22 @@
+# Bootstrap maritime dataset (Singapore Maritime Dataset, Roboflow export v5).
+# License: Public Domain. Source:
+# https://universe.roboflow.com/lyx-limyixian-gmail-com/singapore-maritime/dataset/5
+#
+# Used to bootstrap a buoy/boat detector before fine-tuning on Nordic USV's own
+# footage. Paths are absolute so Ultralytics resolves them regardless of cwd.
+path: /Users/sanderhenriksen/conductor/workspaces/Quickstart/rome/data/datasets/_downloads/singapore_maritime_v5
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 9
+names:
+  - Boat
+  - Buoy
+  - Ferry
+  - Flying bird-plane
+  - Kayak
+  - Other
+  - Sail boat
+  - Speed boat
+  - Vessel-ship
