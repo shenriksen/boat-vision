@@ -1,4 +1,4 @@
-name: Build Windows Installer
+name: Build Windows App
 
 on:
   workflow_dispatch:
@@ -18,29 +18,84 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build BoatVision.exe (launcher)
+      - name: Set version
+        shell: pwsh
+        run: |
+          $v = "1.1.$env:GITHUB_RUN_NUMBER"
+          [System.IO.File]::WriteAllText("VERSION", $v)
+          echo "APPVER=$v" >> $env:GITHUB_ENV
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
-          pyinstaller --onefile --noconsole --name BoatVision --icon boat_vision/static/app_icon.ico launcher.py
-          Copy-Item dist\BoatVision.exe BoatVision.exe -Force
+          pip install torch torchvision
+          pip install -r requirements.txt
+          pip install pywebview pyinstaller
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+      - name: Build folder app (onedir)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --windowed --name BoatVision `
+            --icon boat_vision/static/app_icon.ico `
+            --collect-all ultralytics --collect-all torch --collect-all torchvision `
+            --collect-all cv2 --collect-all webview `
+            --collect-submodules boat_vision --collect-data boat_vision `
+            --copy-metadata torch --copy-metadata torchvision --copy-metadata numpy `
+            --copy-metadata ultralytics --copy-metadata opencv-python --copy-metadata pyyaml `
+            --copy-metadata pillow --copy-metadata tqdm --copy-metadata psutil --copy-metadata requests `
+            --add-data "yolo26n.pt;." --add-data "VERSION;." `
+            --add-data "configs/windows_cameras.example.yaml;configs" `
+            app_native.py
 
-      - name: Build installer
-        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\boatvision.iss'
+      - name: Build single-file EXE (onefile)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "BoatVision-${env:APPVER}" `
+            --icon boat_vision/static/app_icon.ico `
+            --collect-all ultralytics --collect-all torch --collect-all torchvision `
+            --collect-all cv2 --collect-all webview `
+            --collect-submodules boat_vision --collect-data boat_vision `
+            --copy-metadata torch --copy-metadata torchvision --copy-metadata numpy `
+            --copy-metadata ultralytics --copy-metadata opencv-python --copy-metadata pyyaml `
+            --copy-metadata pillow --copy-metadata tqdm --copy-metadata psutil --copy-metadata requests `
+            --add-data "yolo26n.pt;." --add-data "VERSION;." `
+            --add-data "configs/windows_cameras.example.yaml;configs" `
+            app_native.py
 
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+      - name: Make portable ZIP
+        shell: pwsh
+        run: Compress-Archive -Path dist\BoatVision\* -DestinationPath "BoatVision-${env:APPVER}-portable.zip"
+
+      - name: Install WiX
+        run: choco install wixtoolset -y --no-progress
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $wix = "$env:WIX" + "bin"
+          if (-not (Test-Path $wix)) { $wix = "C:\Program Files (x86)\WiX Toolset v3.14\bin" }
+          New-Item -ItemType Directory -Force obj | Out-Null
+          & "$wix\heat.exe" dir dist\BoatVision -cg AppFiles -dr INSTALLDIR -gg -sfrag -srd -scom -sreg -var var.SourceDir -out files.wxs
+          & "$wix\candle.exe" -dSourceDir=dist\BoatVision "-dAppVersion=${env:APPVER}.0" installer\product.wxs files.wxs -out obj\
+          & "$wix\light.exe" obj\product.wixobj obj\files.wixobj -out "BoatVision-${env:APPVER}.msi"
+
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item "dist\BoatVision-${env:APPVER}.exe" "release\BoatVision-${env:APPVER}.exe"
+          Copy-Item "BoatVision-${env:APPVER}-portable.zip" release\
+          Copy-Item "BoatVision-${env:APPVER}.msi" release\
+          Get-ChildItem release | Format-Table Name,Length
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: BoatVisionSetup
-          path: installer/Output/BoatVisionSetup.exe
+          name: BoatVision-Windows
+          path: release/*
 
       - name: Publish release
-        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: Boat Vision Setup v1.0.${{ github.run_number }}
-          files: installer/Output/BoatVisionSetup.exe
+          tag_name: v1.1.${{ github.run_number }}
+          name: Boat Vision v1.1.${{ github.run_number }}
+          files: release/*

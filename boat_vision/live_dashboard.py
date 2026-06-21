@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
-os.environ.setdefault(
-    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0",
-)
+# Use TCP for RTSP (more reliable than the default UDP across networks). We avoid
+# aggressive low-latency flags here because they can stop some cameras from
+# opening at all (VLC works because it uses sane defaults).
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 import cv2
 import yaml
@@ -59,9 +59,21 @@ def is_live_source(source: str) -> bool:
 
 
 def open_capture(source: str) -> cv2.VideoCapture:
-    normalized_source: Any = int(source) if source.isdigit() else source
-    capture = cv2.VideoCapture(normalized_source)
-    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if source.isdigit():
+        return cv2.VideoCapture(int(source))
+    # RTSP/HTTP: force the FFmpeg backend, add open/read timeouts so a bad stream
+    # cannot hang forever, and a small buffer for low latency.
+    capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    for prop, value in (
+        (getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None), 10000),
+        (getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None), 10000),
+        (cv2.CAP_PROP_BUFFERSIZE, 1),
+    ):
+        if prop is not None:
+            try:
+                capture.set(prop, value)
+            except Exception:
+                pass
     return capture
 
 

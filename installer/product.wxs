@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="Boat Vision" Language="1033" Version="$(var.AppVersion)"
+           Manufacturer="Nordic USV" UpgradeCode="7B2C1E4A-9F3D-4C8E-B6A1-2D5F0C9A11AB">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Boat Vision is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLDIR" Name="BoatVision" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="Shortcuts" Guid="9C1D2E3F-4A5B-6C7D-8E9F-0A1B2C3D4E5F">
+        <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="Boat Vision"
+                  Target="[INSTALLDIR]BoatVision.exe" WorkingDirectory="INSTALLDIR" Icon="appicon.ico" />
+        <Shortcut Id="MenuShortcut" Directory="ProgramMenuFolder" Name="Boat Vision"
+                  Target="[INSTALLDIR]BoatVision.exe" WorkingDirectory="INSTALLDIR" Icon="appicon.ico" />
+        <RemoveFolder Id="RemoveMenu" Directory="ProgramMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\NordicUSV\BoatVision" Name="installed"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="Boat Vision" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="Shortcuts" />
+    </Feature>
+
+    <Icon Id="appicon.ico" SourceFile="boat_vision\static\app_icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="appicon.ico" />
+  </Product>
+</Wix>
