@@ -73,7 +73,7 @@ jobs:
           New-Item -ItemType Directory -Force obj | Out-Null
           & "$wix\heat.exe" dir dist\BoatVision -cg AppFiles -dr INSTALLDIR -gg -sfrag -srd -scom -sreg -var var.SourceDir -out files.wxs
           & "$wix\candle.exe" -dSourceDir=dist\BoatVision "-dAppVersion=${env:APPVER}.0" installer\product.wxs files.wxs -out obj\
-          & "$wix\light.exe" obj\product.wixobj obj\files.wixobj -out "BoatVision-${env:APPVER}.msi"
+          & "$wix\light.exe" -sval obj\product.wixobj obj\files.wixobj -out "BoatVision-${env:APPVER}.msi"
 
       - name: Stage release files
         shell: pwsh
