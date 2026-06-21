@@ -40,9 +40,7 @@ jobs:
             --collect-all ultralytics --collect-all torch --collect-all torchvision `
             --collect-all cv2 --collect-all webview `
             --collect-submodules boat_vision --collect-data boat_vision `
-            --copy-metadata torch --copy-metadata torchvision --copy-metadata numpy `
-            --copy-metadata ultralytics --copy-metadata opencv-python --copy-metadata pyyaml `
-            --copy-metadata pillow --copy-metadata tqdm --copy-metadata psutil --copy-metadata requests `
+            --copy-metadata ultralytics --copy-metadata torch --copy-metadata numpy `
             --add-data "yolo26n.pt;." --add-data "VERSION;." `
             --add-data "configs/windows_cameras.example.yaml;configs" `
             app_native.py
@@ -55,9 +53,7 @@ jobs:
             --collect-all ultralytics --collect-all torch --collect-all torchvision `
             --collect-all cv2 --collect-all webview `
             --collect-submodules boat_vision --collect-data boat_vision `
-            --copy-metadata torch --copy-metadata torchvision --copy-metadata numpy `
-            --copy-metadata ultralytics --copy-metadata opencv-python --copy-metadata pyyaml `
-            --copy-metadata pillow --copy-metadata tqdm --copy-metadata psutil --copy-metadata requests `
+            --copy-metadata ultralytics --copy-metadata torch --copy-metadata numpy `
             --add-data "yolo26n.pt;." --add-data "VERSION;." `
             --add-data "configs/windows_cameras.example.yaml;configs" `
             app_native.py
