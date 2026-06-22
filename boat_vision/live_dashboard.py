@@ -1835,13 +1835,28 @@ DASHBOARD_HTML = r"""<!doctype html>
         statusNode.className = `status ${camera.status === 'disabled' ? 'disabled' : ''} ${camera.status.includes('error') ? 'error' : ''}`;
         const img = card.querySelector('img');
         if (camera.status !== 'disabled') {
-          const src = `/stream.mjpg?camera_id=${encodeURIComponent(camera.camera_id)}`;
-          if (!img.src.endsWith(src)) img.src = src;
+          liveCameras.add(camera.camera_id);
         } else {
+          liveCameras.delete(camera.camera_id);
           img.removeAttribute('src');
         }
         renderMarkers(card, camera);
         card.querySelector('pre').textContent = camera.events.map(eventLine).join('\n');
+      }
+    }
+
+    // Show video by rapidly refreshing a still image. This works in every
+    // renderer (browser AND the native window's WebView2, which does not render
+    // multipart MJPEG streams). Double-buffered to avoid flicker.
+    const liveCameras = new Set();
+    function pollImages() {
+      for (const id of liveCameras) {
+        const card = document.querySelector(`.camera[data-camera-id="${CSS.escape(id)}"]`);
+        if (!card) continue;
+        const img = card.querySelector('img');
+        const next = new Image();
+        next.onload = () => { img.src = next.src; };
+        next.src = `/snapshot.jpg?camera_id=${encodeURIComponent(id)}&_=${Date.now()}`;
       }
     }
 
@@ -2245,6 +2260,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     loadConfig().then(() => {
       refreshStatus();
       setInterval(refreshStatus, 500);
+      setInterval(pollImages, 120);
     });
   </script>
 </body>
