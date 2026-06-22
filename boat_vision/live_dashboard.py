@@ -242,6 +242,7 @@ class AppConfig:
     auto_capture_interval: float = 10.0
     auto_capture_max: int = 500
     detection_enabled: bool = True
+    inference_cooldown: float = 0.25  # seconds to rest between AI runs (keeps video smooth)
 
 
 def config_from_dict(data: Dict[str, Any]) -> AppConfig:
@@ -290,6 +291,7 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
         auto_capture_interval=float(app.get("auto_capture_interval", 10.0)),
         auto_capture_max=int(app.get("auto_capture_max", 500)),
         detection_enabled=bool(app.get("detection_enabled", True)),
+        inference_cooldown=float(app.get("inference_cooldown", 0.25)),
         dashboard=DashboardConfig(
             columns=str(dashboard.get("columns", "auto")),
             show_events=bool(dashboard.get("show_events", True)),
@@ -320,6 +322,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "auto_capture_interval": config.auto_capture_interval,
             "auto_capture_max": config.auto_capture_max,
             "detection_enabled": config.detection_enabled,
+            "inference_cooldown": config.inference_cooldown,
         },
         "dashboard": {
             "columns": config.dashboard.columns,
@@ -603,6 +606,11 @@ class CameraWorker:
             self.event_writer.write_many(events)
             with self.lock:
                 self.latest_events = events
+            # Rest between AI runs so the (separate) video pipeline always has CPU.
+            # This makes detection a little slower but keeps the video smooth.
+            cooldown = getattr(self.app, "inference_cooldown", 0.25)
+            if cooldown > 0:
+                time.sleep(cooldown)
 
     def maybe_auto_capture(self) -> None:
         """Passively save a clean frame every N seconds while running, for later labeling."""
