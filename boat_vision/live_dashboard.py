@@ -405,16 +405,20 @@ class CameraWorker:
         self.status = "starting"
         self.frame_index = 0
         self.last_auto_capture = 0.0
+        self.infer_input: Optional[Any] = None  # newest frame for the inference thread
         self.thread = threading.Thread(target=self.run, name=f"camera-{camera.camera_id}", daemon=True)
+        self.infer_thread = threading.Thread(target=self.run_inference, name=f"infer-{camera.camera_id}", daemon=True)
 
     def start(self) -> None:
         self.thread.start()
+        self.infer_thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
 
     def join(self, timeout: float = 2.0) -> None:
         self.thread.join(timeout=timeout)
+        self.infer_thread.join(timeout=timeout)
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
@@ -470,7 +474,7 @@ class CameraWorker:
                     time.sleep(0.01)
                     continue
                 last_frame_id = frame_id
-                self.process_frame(frame)
+                self.show_frame(frame)
         finally:
             reader.stop()
 
@@ -493,67 +497,70 @@ class CameraWorker:
                         self.set_status("stream lost")
                         break
 
-                self.process_frame(frame)
+                self.show_frame(frame)
 
             capture.release()
             time.sleep(1)
 
-    def process_frame(self, frame: Any) -> None:
-        # AI off: show the clean video with no detections (and no GPU usage).
-        if self.detect_flag is not None and not self.detect_flag.is_set():
-            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.app.jpeg_quality])
-            if ok:
-                with self.lock:
-                    self.latest_jpeg = encoded.tobytes()
-                    self.latest_raw_jpeg = encoded.tobytes()
-                    self.latest_image_size = (int(frame.shape[1]), int(frame.shape[0]))
-                    self.latest_events = []
-                    self.frame_index += 1
-                    self.status = "running"
-            self.maybe_auto_capture()
+    def show_frame(self, frame: Any) -> None:
+        """Display path: encode the newest frame for the live view. This runs at
+        camera speed and never waits for AI, so the video stays smooth. The
+        detection markers are drawn client-side from `latest_events`, which the
+        inference thread updates independently."""
+        ok, raw_encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.app.jpeg_quality])
+        if not ok:
             return
-        try:
-            with self.model_lock:
-                result = self.model.predict(
-                    frame,
-                    conf=self.app.confidence_threshold,
-                    iou=self.app.iou_threshold,
-                    imgsz=self.app.image_size,
-                    device=self.app.device,
-                    verbose=False,
-                )[0]
-        except Exception as exc:
-            self.set_status(f"inference error: {exc}")
-            time.sleep(0.2)
-            return
-
-        events = self.events_from_result(result)
-        if self.app.demo_findings:
-            events.extend(self.demo_maritime_events(result.orig_img, len(events)))
-        self.event_writer.write_many(events)
-        raw_ok, raw_encoded = cv2.imencode(
-            ".jpg",
-            result.orig_img,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 92],
-        )
-        annotated = result.orig_img.copy()
-        self.draw_operator_overlay(annotated, events)
-        self.draw_ignore_zones(annotated)
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            annotated,
-            [int(cv2.IMWRITE_JPEG_QUALITY), self.app.jpeg_quality],
-        )
-        if ok:
-            with self.lock:
-                self.latest_jpeg = encoded.tobytes()
-                if raw_ok:
-                    self.latest_raw_jpeg = raw_encoded.tobytes()
-                    self.latest_image_size = (int(result.orig_shape[1]), int(result.orig_shape[0]))
-                self.latest_events = events
-                self.frame_index += 1
-                self.status = "running"
+        display_bytes = raw_encoded.tobytes()
+        if self.camera.ignore_zones:
+            disp = frame.copy()
+            self.draw_ignore_zones(disp)
+            ok2, denc = cv2.imencode(".jpg", disp, [int(cv2.IMWRITE_JPEG_QUALITY), self.app.jpeg_quality])
+            if ok2:
+                display_bytes = denc.tobytes()
+        with self.lock:
+            self.latest_raw_jpeg = raw_encoded.tobytes()
+            self.latest_jpeg = display_bytes
+            self.latest_image_size = (int(frame.shape[1]), int(frame.shape[0]))
+            self.infer_input = frame
+            self.frame_index += 1
+            self.status = "running"
         self.maybe_auto_capture()
+
+    def run_inference(self) -> None:
+        """Inference path: continuously analyse the newest frame, at whatever
+        speed the hardware allows, without blocking the live video."""
+        while not self.stop_event.is_set():
+            if self.detect_flag is not None and not self.detect_flag.is_set():
+                with self.lock:
+                    if self.latest_events:
+                        self.latest_events = []
+                time.sleep(0.1)
+                continue
+            with self.lock:
+                frame = self.infer_input
+            if frame is None:
+                time.sleep(0.03)
+                continue
+            try:
+                with self.model_lock:
+                    result = self.model.predict(
+                        frame,
+                        conf=self.app.confidence_threshold,
+                        iou=self.app.iou_threshold,
+                        imgsz=self.app.image_size,
+                        device=self.app.device,
+                        verbose=False,
+                    )[0]
+            except Exception as exc:
+                print(f"inference error ({self.camera.camera_id}): {exc}")
+                time.sleep(0.5)
+                continue
+            events = self.events_from_result(result)
+            if self.app.demo_findings:
+                events.extend(self.demo_maritime_events(result.orig_img, len(events)))
+            self.event_writer.write_many(events)
+            with self.lock:
+                self.latest_events = events
 
     def maybe_auto_capture(self) -> None:
         """Passively save a clean frame every N seconds while running, for later labeling."""
