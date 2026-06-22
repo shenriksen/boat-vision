@@ -78,6 +78,11 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
+      - name: Fetch bundled Python for installer
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" -OutFile "installer\python-3.12.7-amd64.exe"
+
       - name: Build GPU installer
         shell: pwsh
         run: |

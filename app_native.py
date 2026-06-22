@@ -144,9 +144,16 @@ def main() -> int:
 
     threading.Thread(target=maybe_prompt_update, daemon=True).start()
 
-    import webview
-    webview.create_window(f"Boat Vision  v{app_version()}", URL, width=1480, height=920)
-    webview.start()
+    # Native window (Edge WebView2). If that is unavailable for any reason,
+    # fall back to the default browser so the user still gets the dashboard.
+    try:
+        import webview
+        webview.create_window(f"Boat Vision  v{app_version()}", URL, width=1480, height=920)
+        webview.start()
+    except Exception:
+        import webbrowser
+        webbrowser.open(URL)
+        threading.Event().wait()  # keep the server alive
     return 0
 
 

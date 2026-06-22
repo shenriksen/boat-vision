@@ -36,6 +36,7 @@ Source: "..\configs\*";           DestDir: "{app}\configs";     Flags: recursesu
 Source: "..\models\*";            DestDir: "{app}\models";      Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "..\docs\*";              DestDir: "{app}\docs";        Flags: recursesubdirs ignoreversion
 Source: "postinstall.ps1";        DestDir: "{app}\installer";   Flags: ignoreversion
+Source: "python-3.12.7-amd64.exe"; DestDir: "{app}\installer";  Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}";       Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\app_native.py"""; WorkingDir: "{app}"; IconFilename: "{app}\boat_vision\static\app_icon.ico"
