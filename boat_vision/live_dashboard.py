@@ -40,6 +40,29 @@ MARITIME_CLASSES = [
 ]
 
 
+# Maps any model's class label (generic COCO, the Singapore maritime model, or a
+# custom model) to Boat Vision's internal class names, so display/markers/filters
+# work regardless of which model is loaded.
+CLASS_ALIASES = {
+    "boat": "boat", "ship": "ship", "sailboat": "sailboat", "sail boat": "sailboat",
+    "small_vessel": "small_vessel", "kayak": "small_vessel",
+    "speed boat": "small_vessel", "speedboat": "small_vessel",
+    "buoy": "navigation_buoy", "navigation buoy": "navigation_buoy",
+    "navigation_buoy": "navigation_buoy", "navigation mark": "navigation_buoy",
+    "sea mark": "navigation_buoy", "seamark": "navigation_buoy", "lighthouse": "navigation_buoy",
+    "ferry": "ship", "vessel-ship": "ship", "vessel": "ship",
+    "person": "person", "swimmer": "person",
+    "floating_object": "floating_object", "floating object": "floating_object",
+    "other": "floating_object", "flying bird-plane": "floating_object",
+    "red_lateral_mark": "red_lateral_mark", "green_lateral_mark": "green_lateral_mark",
+    "cardinal_mark": "cardinal_mark", "special_mark": "special_mark",
+}
+
+
+def normalize_class(name: str) -> str:
+    return CLASS_ALIASES.get(str(name).strip().lower(), str(name))
+
+
 def masked_source(source: str) -> str:
     return re.sub(r"(rtsp://)([^:/@\s]+):([^@\s]+)@", r"\1***:***@", source)
 
@@ -186,6 +209,7 @@ class CameraConfig:
     enabled: bool
     allowed_classes: Optional[List[str]]
     ignore_zones: List[Dict[str, float]]
+    ignore_polygons: List[List[Dict[str, float]]] = None
 
 
 @dataclass
@@ -196,6 +220,7 @@ class DashboardConfig:
     view_mode: str
     show_labels: bool = True
     show_status: bool = True
+    show_vessel_area: bool = True
 
 
 @dataclass
@@ -237,6 +262,11 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
                 }
                 for zone in camera.get("ignore_zones", [])
             ],
+            ignore_polygons=[
+                [{"x": float(pt.get("x", 0.0)), "y": float(pt.get("y", 0.0))} for pt in poly]
+                for poly in (camera.get("ignore_polygons") or [])
+                if isinstance(poly, list) and len(poly) >= 3
+            ],
         )
         for camera in data.get("cameras", [])
         if str(camera.get("camera_id", "")).strip() and str(camera.get("source", "")).strip()
@@ -266,6 +296,7 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
             view_mode=str(dashboard.get("view_mode", "workspace")),
             show_labels=bool(dashboard.get("show_labels", True)),
             show_status=bool(dashboard.get("show_status", True)),
+            show_vessel_area=bool(dashboard.get("show_vessel_area", True)),
         ),
         cameras=cameras,
     )
@@ -296,6 +327,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "view_mode": config.dashboard.view_mode,
             "show_labels": config.dashboard.show_labels,
             "show_status": config.dashboard.show_status,
+            "show_vessel_area": config.dashboard.show_vessel_area,
         },
         "cameras": [
             {
@@ -305,6 +337,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
                 "enabled": camera.enabled,
                 "allowed_classes": camera.allowed_classes or [],
                 "ignore_zones": camera.ignore_zones,
+                "ignore_polygons": camera.ignore_polygons or [],
             }
             for camera in config.cameras
         ],
@@ -519,7 +552,7 @@ class CameraWorker:
         if not ok:
             return
         display_bytes = raw_encoded.tobytes()
-        if self.camera.ignore_zones:
+        if (self.camera.ignore_zones or self.camera.ignore_polygons) and self.app.dashboard.show_vessel_area:
             disp = frame.copy()
             self.draw_ignore_zones(disp)
             ok2, denc = cv2.imencode(".jpg", disp, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
@@ -744,27 +777,46 @@ class CameraWorker:
         cv2.line(frame, (x2, y2), (x2, y2 - length), color, thickness, cv2.LINE_AA)
 
     def draw_ignore_zones(self, frame: Any) -> None:
-        if not self.camera.ignore_zones:
-            return
+        import numpy as np  # noqa: PLC0415
         height, width = frame.shape[:2]
         overlay = frame.copy()
-        for zone in self.camera.ignore_zones:
-            x1 = int(zone["x1"] * width)
-            y1 = int(zone["y1"] * height)
-            x2 = int(zone["x2"] * width)
-            y2 = int(zone["y2"] * height)
+        drew = False
+        for zone in (self.camera.ignore_zones or []):
+            x1 = int(zone["x1"] * width); y1 = int(zone["y1"] * height)
+            x2 = int(zone["x2"] * width); y2 = int(zone["y2"] * height)
             cv2.rectangle(overlay, (x1, y1), (x2, y2), (80, 80, 80), -1)
             cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 60, 60), 2)
-            cv2.putText(frame, "ignored own vessel", (x1 + 8, max(y1 + 24, 24)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 40), 2)
-        cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
+            drew = True
+        for poly in (self.camera.ignore_polygons or []):
+            pts = np.array([[int(p["x"] * width), int(p["y"] * height)] for p in poly], dtype=np.int32)
+            if len(pts) >= 3:
+                cv2.fillPoly(overlay, [pts], (80, 80, 80))
+                cv2.polylines(frame, [pts], True, (60, 60, 60), 2)
+                drew = True
+        if drew:
+            cv2.addWeighted(overlay, 0.30, frame, 0.70, 0, frame)
+
+    @staticmethod
+    def _point_in_polygon(px: float, py: float, poly: List[Dict[str, float]]) -> bool:
+        inside = False
+        n = len(poly)
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]["x"], poly[i]["y"]
+            xj, yj = poly[j]["x"], poly[j]["y"]
+            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / ((yj - yi) or 1e-9) + xi):
+                inside = not inside
+            j = i
+        return inside
 
     def is_ignored(self, x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> bool:
-        if not self.camera.ignore_zones:
-            return False
         center_x = ((x1 + x2) / 2) / width
         center_y = ((y1 + y2) / 2) / height
-        for zone in self.camera.ignore_zones:
+        for zone in (self.camera.ignore_zones or []):
             if zone["x1"] <= center_x <= zone["x2"] and zone["y1"] <= center_y <= zone["y2"]:
+                return True
+        for poly in (self.camera.ignore_polygons or []):
+            if len(poly) >= 3 and self._point_in_polygon(center_x, center_y, poly):
                 return True
         return False
 
@@ -782,7 +834,7 @@ class CameraWorker:
             boxes.cls.cpu().tolist(),
         ):
             class_id = int(class_value)
-            class_name = str((result.names or {}).get(class_id, class_id))
+            class_name = normalize_class(str((result.names or {}).get(class_id, class_id)))
             if allowed and class_name not in allowed:
                 continue
 
@@ -998,6 +1050,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             ".css": "text/css", ".woff2": "font/woff2", ".woff": "font/woff",
             ".ttf": "font/ttf", ".js": "application/javascript", ".png": "image/png",
             ".svg": "image/svg+xml", ".ico": "image/x-icon", ".jpg": "image/jpeg",
+            ".mp3": "audio/mpeg",
         }
         ctype = types.get(target.suffix.lower(), "application/octet-stream")
         data = target.read_bytes()
@@ -1386,8 +1439,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
     .modal-head strong { font-size: 15px; }
     .modal-body { padding: 16px; display: grid; gap: 12px; }
-    .zone-canvas { position: relative; min-height: 360px; background: #d4dadd; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: crosshair; }
-    .zone-canvas img { width: 100%; height: auto; aspect-ratio: auto; object-fit: contain; user-select: none; pointer-events: none; }
+    .zone-canvas { position: relative; background: #0c1620; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: crosshair; line-height: 0; }
+    .zone-canvas img { width: 100%; height: auto; display: block; user-select: none; pointer-events: none; }
+    #zone-svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+    #zone-svg polygon { fill: rgba(245,158,11,0.22); stroke: #f59e0b; stroke-width: 0.4; }
+    #zone-svg circle { fill: #fff; stroke: #f59e0b; stroke-width: 0.4; }
     .zone-box { position: absolute; border: 2px solid #f59e0b; background: rgba(245,158,11,0.22); display: none; pointer-events: none; }
     .label-box { border-color: #0ea5e9; background: rgba(14,165,233,0.18); }
     .hint { color: var(--muted); font-size: 12px; }
@@ -1455,9 +1511,10 @@ DASHBOARD_HTML = r"""<!doctype html>
     .camera:hover { box-shadow: none; border: 0; }
     .camera img { width: 100%; height: 100%; aspect-ratio: auto; object-fit: contain; background: #0b1117; }
     .overlay { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
-    .marker { position: absolute; transform: translate(-50%, -50%); display: flex; flex-direction: column;
-      align-items: center; gap: 5px; transition: left 220ms ease, top 220ms ease; }
-    .marker .badge { width: 34px; height: 34px; border-radius: 999px; display: grid; place-items: center;
+    /* Marker sits ABOVE the object; a leader line points down to it. */
+    .marker { position: absolute; transform: translate(-50%, -100%); display: flex; flex-direction: column;
+      align-items: center; gap: 4px; transition: left 180ms ease, top 180ms ease; }
+    .marker .badge { width: 32px; height: 32px; border-radius: 999px; display: grid; place-items: center;
       color: #fff; font-size: 14px; border: 2px solid rgba(255,255,255,0.95);
       box-shadow: 0 3px 10px rgba(0,0,0,0.45); }
     .marker.alarm .badge { background: #e0443b; }
@@ -1466,6 +1523,10 @@ DASHBOARD_HTML = r"""<!doctype html>
     .marker .tag { font-size: 11px; font-weight: 600; color: #0e1a24; background: rgba(255,255,255,0.86);
       border: 1px solid rgba(255,255,255,0.7); border-radius: 999px; padding: 2px 9px; white-space: nowrap;
       backdrop-filter: blur(8px); box-shadow: 0 2px 8px rgba(8,15,22,0.2); font-variant-numeric: tabular-nums; }
+    .marker .leader { width: 2px; height: 28px; background: rgba(255,255,255,0.92);
+      box-shadow: 0 0 3px rgba(0,0,0,0.6); }
+    .marker .leader::after { content: ''; position: absolute; bottom: -3px; left: 50%; transform: translateX(-50%);
+      width: 7px; height: 7px; border-radius: 999px; background: #fff; box-shadow: 0 0 3px rgba(0,0,0,0.6); }
     .app.hide-labels .camera-header h2 { display: none; }
     .app.hide-status .camera-header .status { display: none; }
     .camera-header { position: absolute; z-index: 3; top: 12px; left: 12px; right: 12px; min-height: 0;
@@ -1599,6 +1660,8 @@ DASHBOARD_HTML = r"""<!doctype html>
           </div>
           <label class="check"><input id="show-labels" type="checkbox"> Show camera labels</label>
           <label class="check"><input id="show-status" type="checkbox"> Show status / frame counter</label>
+          <label class="check"><input id="show-vessel-area" type="checkbox"> Show own-vessel area on video</label>
+          <label class="check"><input id="alert-sound" type="checkbox"> Alert sound on new detections</label>
           <label class="check"><input id="show-events" type="checkbox"> Show recent events</label>
           <label class="check"><input id="start-wall-mode" type="checkbox"> Start in camera wall mode</label>
         </fieldset>
@@ -1620,14 +1683,15 @@ DASHBOARD_HTML = r"""<!doctype html>
           <button id="zone-close">Close</button>
         </div>
         <div class="modal-body">
-          <div class="hint">Drag a rectangle over the part of this camera image that shows your own boat. Detections centered inside the rectangle will be ignored.</div>
+          <div class="hint">Click around the part of the image that shows your own boat to draw a polygon (add 3+ points). Detections centered inside it are ignored.</div>
           <div id="zone-canvas" class="zone-canvas">
-            <img id="zone-image" alt="Camera frame for marking ignored area">
-            <div id="zone-box" class="zone-box"></div>
+            <img id="zone-image" alt="Camera frame for marking own-vessel area">
+            <svg id="zone-svg" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
           </div>
           <div class="actions">
+            <button id="zone-undo">Undo point</button>
             <button id="zone-apply" class="primary">Use marked area</button>
-            <button id="zone-clear">Clear this camera</button>
+            <button id="zone-clear">Clear</button>
           </div>
           <div id="zone-output" class="hint"></div>
         </div>
@@ -1659,6 +1723,10 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <script>
     let config = null;
+    let alertSoundOn = (localStorage.getItem('bv-alert-sound') !== 'off');
+    const alertAudio = new Audio('/static/sounds/alert.mp3');
+    let lastAlertTime = 0;
+    const prevCatCounts = {};   // per camera_id -> {person, mark, vessel}
     let activeZoneTextarea = null;
     let activeZone = null;
     let dragStart = null;
@@ -1812,6 +1880,36 @@ DASHBOARD_HTML = r"""<!doctype html>
       return classIcons[className] || 'fa-solid fa-location-crosshairs';
     }
 
+    // Alert categories: person & marks always alert on a new one; vessels only
+    // when fewer than 3 are present. Floating objects do not alert.
+    function alertCategory(name) {
+      if (name === 'person') return 'person';
+      if (['navigation_buoy','red_lateral_mark','green_lateral_mark','cardinal_mark','special_mark'].includes(name)) return 'mark';
+      if (['boat','ship','sailboat','small_vessel'].includes(name)) return 'vessel';
+      return null;
+    }
+    function checkAlerts(status) {
+      if (!alertSoundOn) return;
+      let trigger = false;
+      for (const cam of status.cameras) {
+        const counts = {person: 0, mark: 0, vessel: 0};
+        for (const d of (cam.detections || [])) {
+          const cat = alertCategory(d.class_name);
+          if (cat) counts[cat]++;
+        }
+        const prev = prevCatCounts[cam.camera_id] || {person: 0, mark: 0, vessel: 0};
+        if (counts.person > prev.person) trigger = true;
+        if (counts.mark > prev.mark) trigger = true;
+        if (counts.vessel > prev.vessel && counts.vessel < 3) trigger = true;
+        prevCatCounts[cam.camera_id] = counts;
+      }
+      const now = Date.now();
+      if (trigger && now - lastAlertTime > 1500) {
+        lastAlertTime = now;
+        try { alertAudio.currentTime = 0; alertAudio.play().catch(() => {}); } catch (e) {}
+      }
+    }
+
     function renderMarkers(card, camera) {
       const overlay = card.querySelector('.overlay');
       if (!overlay) return;
@@ -1834,12 +1932,14 @@ DASHBOARD_HTML = r"""<!doctype html>
         return `<div class="marker ${d.severity}" style="left:${px.toFixed(1)}px; top:${py.toFixed(1)}px">
           <span class="badge"><i class="${classIcon(d.class_name)}"></i></span>
           <span class="tag">${d.label}${conf}</span>
+          <span class="leader"></span>
         </div>`;
       }).join('');
     }
 
     function updateCameraCards(status) {
       if (typeof status.detection_enabled === 'boolean') reflectAi(status.detection_enabled);
+      checkAlerts(status);
       renderCameraCards(status);
       for (const camera of status.cameras) {
         const card = document.querySelector(`.camera[data-camera-id="${CSS.escape(camera.camera_id)}"]`);
@@ -1890,9 +1990,11 @@ DASHBOARD_HTML = r"""<!doctype html>
         </div>
         <label>RTSP, HTTP, or local video source<input class="camera-source"></label>
         <label>Allowed classes<textarea class="camera-classes" placeholder="boat, person"></textarea></label>
-        <label>Ignore zones for own vessel<textarea class="camera-ignore-zones" placeholder="Use the marker button or enter x1, y1, x2, y2"></textarea></label>
+        <input class="camera-polygons" type="hidden">
+        <input class="camera-ignore-zones" type="hidden">
         <div class="actions">
           <button class="mark-zone">Mark own vessel area</button>
+          <span class="poly-info hint"></span>
           <button class="capture-label">Save training label</button>
         </div>
       `;
@@ -1902,10 +2004,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       wrapper.querySelector('.camera-source').value = camera.source || '';
       wrapper.querySelector('.camera-classes').value = (camera.allowed_classes || []).join(', ');
       wrapper.querySelector('.camera-ignore-zones').value = zoneText(camera.ignore_zones || []);
+      wrapper.querySelector('.camera-polygons').value = JSON.stringify(camera.ignore_polygons || []);
+      const polyInfo = wrapper.querySelector('.poly-info');
+      polyInfo.textContent = describePolys(camera.ignore_polygons || []);
       wrapper.querySelector('.mark-zone').addEventListener('click', () => {
         openZoneModal(
           wrapper.querySelector('.camera-id').value.trim(),
-          wrapper.querySelector('.camera-ignore-zones')
+          wrapper.querySelector('.camera-polygons'),
+          polyInfo
         );
       });
       wrapper.querySelector('.capture-label').addEventListener('click', () => {
@@ -1933,6 +2039,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       $('card-min-width').value = config.dashboard.card_min_width;
       $('show-labels').checked = config.dashboard.show_labels !== false;
       $('show-status').checked = config.dashboard.show_status !== false;
+      $('show-vessel-area').checked = config.dashboard.show_vessel_area !== false;
+      $('alert-sound').checked = alertSoundOn;
       $('show-events').checked = config.dashboard.show_events;
       $('start-wall-mode').checked = config.dashboard.view_mode === 'wall';
 
@@ -1957,16 +2065,22 @@ DASHBOARD_HTML = r"""<!doctype html>
       config.dashboard.card_min_width = Number($('card-min-width').value || 420);
       config.dashboard.show_labels = $('show-labels').checked;
       config.dashboard.show_status = $('show-status').checked;
+      config.dashboard.show_vessel_area = $('show-vessel-area').checked;
       config.dashboard.show_events = $('show-events').checked;
       config.dashboard.view_mode = $('start-wall-mode').checked ? 'wall' : 'workspace';
-      config.cameras = [...document.querySelectorAll('.camera-config')].map((node) => ({
-        enabled: node.querySelector('.camera-enabled').checked,
-        camera_id: node.querySelector('.camera-id').value.trim(),
-        name: node.querySelector('.camera-name').value.trim(),
-        source: node.querySelector('.camera-source').value.trim(),
-        allowed_classes: node.querySelector('.camera-classes').value.split(',').map((item) => item.trim()).filter(Boolean),
-        ignore_zones: parseZones(node.querySelector('.camera-ignore-zones').value),
-      }));
+      config.cameras = [...document.querySelectorAll('.camera-config')].map((node) => {
+        let polys = [];
+        try { polys = JSON.parse(node.querySelector('.camera-polygons').value || '[]'); } catch (e) {}
+        return {
+          enabled: node.querySelector('.camera-enabled').checked,
+          camera_id: node.querySelector('.camera-id').value.trim(),
+          name: node.querySelector('.camera-name').value.trim(),
+          source: node.querySelector('.camera-source').value.trim(),
+          allowed_classes: node.querySelector('.camera-classes').value.split(',').map((item) => item.trim()).filter(Boolean),
+          ignore_zones: parseZones(node.querySelector('.camera-ignore-zones').value),
+          ignore_polygons: polys,
+        };
+      });
     }
 
     async function loadConfig() {
@@ -2002,72 +2116,61 @@ DASHBOARD_HTML = r"""<!doctype html>
       updateCameraCards(await response.json());
     }
 
-    function showZoneBox(zone) {
-      const box = $('zone-box');
-      const canvas = $('zone-canvas');
-      const width = canvas.clientWidth;
-      const height = $('zone-image').clientHeight;
-      box.style.left = `${zone.x1 * width}px`;
-      box.style.top = `${zone.y1 * height}px`;
-      box.style.width = `${(zone.x2 - zone.x1) * width}px`;
-      box.style.height = `${(zone.y2 - zone.y1) * height}px`;
-      box.style.display = 'block';
-      $('zone-output').textContent = zoneText([zone]);
+    // ---- Own-vessel area: polygon drawing ----
+    let activePolyInput = null, activePolyInfo = null, polyPoints = [];
+
+    function describePolys(polys) {
+      if (!polys || !polys.length || !(polys[0] || []).length) return 'No own-vessel area set';
+      const n = (polys[0] || []).length;
+      return `Own-vessel polygon: ${n} point${n === 1 ? '' : 's'}`;
     }
 
     function pointInImage(event) {
-      const image = $('zone-image');
-      const rect = image.getBoundingClientRect();
-      const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-      const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
-      return {x, y};
+      const rect = $('zone-image').getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+        y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+      };
     }
 
-    function openZoneModal(cameraId, textarea) {
+    function renderPoly() {
+      const svg = $('zone-svg');
+      const pts = polyPoints.map((p) => `${(p.x * 100).toFixed(2)},${(p.y * 100).toFixed(2)}`).join(' ');
+      let inner = polyPoints.length >= 2 ? `<polygon points="${pts}"></polygon>` : '';
+      for (const p of polyPoints) inner += `<circle cx="${(p.x * 100).toFixed(2)}" cy="${(p.y * 100).toFixed(2)}" r="1.2"></circle>`;
+      svg.innerHTML = inner;
+      $('zone-output').textContent = `${polyPoints.length} point(s) — click to add, need at least 3`;
+    }
+
+    function openZoneModal(cameraId, polyInput, polyInfo) {
       if (!cameraId) {
-        $('message').textContent = 'Save the camera ID before marking an ignore zone.';
+        $('message').textContent = 'Save the camera ID before marking the own-vessel area.';
         return;
       }
-      activeZoneTextarea = textarea;
-      activeZone = null;
-      $('zone-box').style.display = 'none';
-      $('zone-output').textContent = '';
+      activePolyInput = polyInput;
+      activePolyInfo = polyInfo;
+      let existing = [];
+      try { existing = JSON.parse(polyInput.value || '[]'); } catch (e) {}
+      polyPoints = ((existing[0] || [])).map((p) => ({x: p.x, y: p.y}));
       $('zone-image').src = `/snapshot.jpg?camera_id=${encodeURIComponent(cameraId)}&marker=${Date.now()}`;
+      renderPoly();
       $('zone-modal').classList.add('open');
     }
 
-    $('zone-canvas').addEventListener('mousedown', (event) => {
-      dragStart = pointInImage(event);
-      activeZone = {x1: dragStart.x, y1: dragStart.y, x2: dragStart.x, y2: dragStart.y};
-      showZoneBox(activeZone);
+    $('zone-canvas').addEventListener('click', (event) => {
+      if (event.target.tagName === 'BUTTON') return;
+      polyPoints.push(pointInImage(event));
+      renderPoly();
     });
-    window.addEventListener('mousemove', (event) => {
-      if (!dragStart) return;
-      const point = pointInImage(event);
-      activeZone = {
-        x1: Math.min(dragStart.x, point.x),
-        y1: Math.min(dragStart.y, point.y),
-        x2: Math.max(dragStart.x, point.x),
-        y2: Math.max(dragStart.y, point.y),
-      };
-      showZoneBox(activeZone);
-    });
-    window.addEventListener('mouseup', () => {
-      dragStart = null;
-    });
+    $('zone-undo').addEventListener('click', () => { polyPoints.pop(); renderPoly(); });
     $('zone-apply').addEventListener('click', () => {
-      if (!activeZone || !activeZoneTextarea) return;
-      const existing = activeZoneTextarea.value.trim();
-      activeZoneTextarea.value = [existing, zoneText([activeZone])].filter(Boolean).join('\n');
+      if (!activePolyInput) return;
+      activePolyInput.value = polyPoints.length >= 3 ? JSON.stringify([polyPoints]) : '[]';
+      if (activePolyInfo) activePolyInfo.textContent = describePolys(JSON.parse(activePolyInput.value));
       $('zone-modal').classList.remove('open');
     });
-    $('zone-clear').addEventListener('click', () => {
-      if (activeZoneTextarea) activeZoneTextarea.value = '';
-      $('zone-modal').classList.remove('open');
-    });
-    $('zone-close').addEventListener('click', () => {
-      $('zone-modal').classList.remove('open');
-    });
+    $('zone-clear').addEventListener('click', () => { polyPoints = []; renderPoly(); });
+    $('zone-close').addEventListener('click', () => { $('zone-modal').classList.remove('open'); });
 
     function populateLabelClasses() {
       const select = $('label-class');
@@ -2191,6 +2294,11 @@ DASHBOARD_HTML = r"""<!doctype html>
         applyLayout();
       });
     }
+    $('alert-sound').addEventListener('change', (e) => {
+      alertSoundOn = e.target.checked;
+      localStorage.setItem('bv-alert-sound', alertSoundOn ? 'on' : 'off');
+      if (alertSoundOn) { try { alertAudio.play().then(() => { alertAudio.pause(); alertAudio.currentTime = 0; }).catch(() => {}); } catch (e) {} }
+    });
 
     // ---- OpenBridge Brilliance + Day/Dusk/Night theme ----
     function applyTheme(theme) {
