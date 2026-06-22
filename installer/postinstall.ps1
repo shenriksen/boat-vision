@@ -26,6 +26,9 @@ Write-Host "Installing PyTorch (GPU/CUDA build) - this downloads about 2.5 GB, p
 Write-Host "Installing application dependencies..."
 .\.venv\Scripts\pip.exe install -r requirements.txt
 
+Write-Host "Installing native-window support..."
+.\.venv\Scripts\pip.exe install pywebview
+
 # Make sure runtime folders exist (writable, since we install per-user).
 foreach ($d in @("outputs\events","outputs\annotated","data\datasets\maritime\raw_frames","models\maritime")) {
   New-Item -ItemType Directory -Force -Path $d | Out-Null

@@ -75,6 +75,15 @@ jobs:
           & "$wix\candle.exe" -dSourceDir=dist\BoatVision "-dAppVersion=${env:APPVER}.0" installer\product.wxs files.wxs -out obj\
           & "$wix\light.exe" -sval obj\product.wixobj obj\files.wixobj -out "BoatVision-${env:APPVER}.msi"
 
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build GPU installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & "$iscc" "/dMyAppVersion=${env:APPVER}" installer\boatvision.iss
+
       - name: Stage release files
         shell: pwsh
         run: |
@@ -82,6 +91,7 @@ jobs:
           Copy-Item "dist\BoatVision-${env:APPVER}.exe" "release\BoatVision-${env:APPVER}.exe"
           Copy-Item "BoatVision-${env:APPVER}-portable.zip" release\
           Copy-Item "BoatVision-${env:APPVER}.msi" release\
+          Copy-Item "installer\Output\BoatVisionSetup.exe" "release\BoatVision-GPU-Setup-${env:APPVER}.exe"
           Get-ChildItem release | Format-Table Name,Length
 
       - uses: actions/upload-artifact@v4
