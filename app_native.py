@@ -71,8 +71,11 @@ def start_server(config_path: Path) -> None:
     import torch
 
     config = d.load_config(config_path)
-    # Fall back to CPU if no GPU is present (this standalone ships CPU PyTorch).
-    if not torch.cuda.is_available() and str(config.device) not in ("cpu", "mps", "None", ""):
+    # The frozen standalone ships CPU PyTorch, so always use CPU there. The GPU
+    # build runs this un-frozen (in a venv) and keeps the configured device.
+    if getattr(sys, "frozen", False):
+        config.device = "cpu"
+    elif not torch.cuda.is_available():
         config.device = "cpu"
     config.host = "127.0.0.1"
     config.port = PORT
