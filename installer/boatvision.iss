@@ -31,6 +31,7 @@ Source: "..\requirements.txt";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README_WINDOWS.md";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\VERSION";             DestDir: "{app}"; Flags: ignoreversion
 Source: "..\yolo26n.pt";          DestDir: "{app}"; Flags: ignoreversion
+Source: "..\yolo26s.pt";          DestDir: "{app}"; Flags: ignoreversion
 Source: "..\boat_vision\*";       DestDir: "{app}\boat_vision"; Flags: recursesubdirs ignoreversion
 Source: "..\configs\*";           DestDir: "{app}\configs";     Flags: recursesubdirs ignoreversion
 Source: "..\models\*";            DestDir: "{app}\models";      Flags: recursesubdirs createallsubdirs ignoreversion

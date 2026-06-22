@@ -74,7 +74,13 @@ class PyAvCapture:
 
             self._container = av.open(
                 url,
-                options={"rtsp_transport": "tcp", "stimeout": "10000000", "max_delay": "500000"},
+                options={
+                    "rtsp_transport": "tcp",
+                    "stimeout": "10000000",
+                    "fflags": "nobuffer",
+                    "flags": "low_delay",
+                    "max_delay": "200000",
+                },
                 timeout=12,
             )
             stream = self._container.streams.video[0]
@@ -134,7 +140,7 @@ def open_capture(source: str) -> Any:
 
 def load_yolo_model(model_path: str) -> tuple[YOLO, str, bool]:
     if model_path.endswith(".pt") and not Path(model_path).exists():
-        fallback = "yolo26n.pt"
+        fallback = "yolo26s.pt" if Path("yolo26s.pt").exists() else "yolo26n.pt"
         print(f"Configured model not found: {model_path}. Falling back to {fallback}.")
         return YOLO(fallback), fallback, True
     return YOLO(model_path), model_path, False
@@ -507,14 +513,16 @@ class CameraWorker:
         camera speed and never waits for AI, so the video stays smooth. The
         detection markers are drawn client-side from `latest_events`, which the
         inference thread updates independently."""
-        ok, raw_encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.app.jpeg_quality])
+        # Display over localhost, so favour quality (>= 90) regardless of the config.
+        quality = max(int(self.app.jpeg_quality), 90)
+        ok, raw_encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
         if not ok:
             return
         display_bytes = raw_encoded.tobytes()
         if self.camera.ignore_zones:
             disp = frame.copy()
             self.draw_ignore_zones(disp)
-            ok2, denc = cv2.imencode(".jpg", disp, [int(cv2.IMWRITE_JPEG_QUALITY), self.app.jpeg_quality])
+            ok2, denc = cv2.imencode(".jpg", disp, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
             if ok2:
                 display_bytes = denc.tobytes()
         with self.lock:
@@ -2267,7 +2275,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     loadConfig().then(() => {
       refreshStatus();
       setInterval(refreshStatus, 500);
-      setInterval(pollImages, 120);
+      setInterval(pollImages, 50);
     });
   </script>
 </body>

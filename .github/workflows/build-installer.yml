@@ -41,7 +41,7 @@ jobs:
             --collect-all cv2 --collect-all webview --collect-all av `
             --collect-submodules boat_vision --collect-data boat_vision `
             --copy-metadata ultralytics --copy-metadata torch --copy-metadata numpy `
-            --add-data "yolo26n.pt;." --add-data "VERSION;." `
+            --add-data "yolo26n.pt;." --add-data "yolo26s.pt;." --add-data "VERSION;." `
             --add-data "configs/windows_cameras.example.yaml;configs" `
             app_native.py
 
@@ -54,7 +54,7 @@ jobs:
             --collect-all cv2 --collect-all webview --collect-all av `
             --collect-submodules boat_vision --collect-data boat_vision `
             --copy-metadata ultralytics --copy-metadata torch --copy-metadata numpy `
-            --add-data "yolo26n.pt;." --add-data "VERSION;." `
+            --add-data "yolo26n.pt;." --add-data "yolo26s.pt;." --add-data "VERSION;." `
             --add-data "configs/windows_cameras.example.yaml;configs" `
             app_native.py
 

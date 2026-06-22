@@ -51,10 +51,11 @@ def prepare_data(data: Path) -> Path:
                 "outputs/events", "outputs/annotated"):
         (data / sub).mkdir(parents=True, exist_ok=True)
 
-    # Bundled defaults copied in on first run.
-    yolo = data / "yolo26n.pt"
-    if not yolo.exists() and (bundle / "yolo26n.pt").exists():
-        shutil.copy2(bundle / "yolo26n.pt", yolo)
+    # Bundled default model(s) copied in on first run.
+    for weights in ("yolo26s.pt", "yolo26n.pt"):
+        dst = data / weights
+        if not dst.exists() and (bundle / weights).exists():
+            shutil.copy2(bundle / weights, dst)
 
     example = data / "configs" / "windows_cameras.example.yaml"
     if (bundle / "configs" / "windows_cameras.example.yaml").exists():
