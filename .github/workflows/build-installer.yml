@@ -38,7 +38,7 @@ jobs:
           pyinstaller --noconfirm --windowed --name BoatVision `
             --icon boat_vision/static/app_icon.ico `
             --collect-all ultralytics --collect-all torch --collect-all torchvision `
-            --collect-all cv2 --collect-all webview `
+            --collect-all cv2 --collect-all webview --collect-all av `
             --collect-submodules boat_vision --collect-data boat_vision `
             --copy-metadata ultralytics --copy-metadata torch --copy-metadata numpy `
             --add-data "yolo26n.pt;." --add-data "VERSION;." `
@@ -51,7 +51,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name "BoatVision-${env:APPVER}" `
             --icon boat_vision/static/app_icon.ico `
             --collect-all ultralytics --collect-all torch --collect-all torchvision `
-            --collect-all cv2 --collect-all webview `
+            --collect-all cv2 --collect-all webview --collect-all av `
             --collect-submodules boat_vision --collect-data boat_vision `
             --copy-metadata ultralytics --copy-metadata torch --copy-metadata numpy `
             --add-data "yolo26n.pt;." --add-data "VERSION;." `

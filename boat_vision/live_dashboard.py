@@ -58,11 +58,66 @@ def is_live_source(source: str) -> bool:
     return source.isdigit() or lowered.startswith(("rtsp://", "http://", "https://"))
 
 
-def open_capture(source: str) -> cv2.VideoCapture:
+class PyAvCapture:
+    """A cv2.VideoCapture-compatible reader backed by PyAV.
+
+    PyAV's FFmpeg handles RTSP authentication like VLC does, so it connects to
+    cameras that OpenCV's RTSP auth rejects with 401. Exposes the small subset
+    of the VideoCapture API the workers use (isOpened/read/set/release).
+    """
+
+    def __init__(self, url: str) -> None:
+        self._container = None
+        self._frames = None
+        try:
+            import av  # noqa: PLC0415
+
+            self._container = av.open(
+                url,
+                options={"rtsp_transport": "tcp", "stimeout": "10000000", "max_delay": "500000"},
+                timeout=12,
+            )
+            stream = self._container.streams.video[0]
+            stream.thread_type = "AUTO"
+            self._frames = self._container.decode(stream)
+        except Exception as exc:  # noqa: BLE001
+            print(f"PyAV could not open {masked_source(url)}: {exc}")
+            self.release()
+
+    def isOpened(self) -> bool:
+        return self._frames is not None
+
+    def read(self):
+        if self._frames is None:
+            return False, None
+        try:
+            frame = next(self._frames)
+            return True, frame.to_ndarray(format="bgr24")
+        except Exception:
+            return False, None
+
+    def set(self, *args, **kwargs) -> bool:
+        return True
+
+    def release(self) -> None:
+        try:
+            if self._container is not None:
+                self._container.close()
+        except Exception:
+            pass
+        self._container = None
+        self._frames = None
+
+
+def open_capture(source: str) -> Any:
     if source.isdigit():
         return cv2.VideoCapture(int(source))
-    # RTSP/HTTP: force the FFmpeg backend, add open/read timeouts so a bad stream
-    # cannot hang forever, and a small buffer for low latency.
+    # RTSP: prefer PyAV (VLC-like auth). Fall back to OpenCV/FFmpeg if it fails.
+    if source.lower().startswith("rtsp://"):
+        av_cap = PyAvCapture(source)
+        if av_cap.isOpened():
+            return av_cap
+    # HTTP/file (or RTSP fallback): OpenCV FFmpeg with open/read timeouts.
     capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
     for prop, value in (
         (getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None), 10000),
