@@ -140,6 +140,38 @@ def load_yolo_model(model_path: str) -> tuple[YOLO, str, bool]:
     return YOLO(model_path), model_path, False
 
 
+def resolve_device(requested: Optional[str]) -> str:
+    """Return a device that actually works.
+
+    torch.cuda.is_available() can return True on a machine whose GPU build still
+    can't launch kernels (e.g. 'no kernel image is available for execution on the
+    device' / driver mismatch). We verify a real kernel launch and fall back to
+    CPU so the app always runs.
+    """
+    req = "" if requested is None else str(requested).strip()
+    if req == "cpu":
+        return "cpu"
+    try:
+        import torch  # noqa: PLC0415
+
+        if req in ("", "auto"):
+            req = "0" if torch.cuda.is_available() else "cpu"
+        if req == "mps":
+            ok = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+            return "mps" if ok else "cpu"
+        if req.isdigit():
+            if not torch.cuda.is_available():
+                print("CUDA not available; using CPU.")
+                return "cpu"
+            probe = torch.zeros(16, device=f"cuda:{req}")
+            float((probe + 1).sum().item())  # forces a kernel launch
+            return req
+    except Exception as exc:  # noqa: BLE001
+        print(f"GPU not usable ({exc}); falling back to CPU.")
+        return "cpu"
+    return req or "cpu"
+
+
 @dataclass
 class CameraConfig:
     camera_id: str
@@ -809,6 +841,7 @@ class DashboardState:
     def __init__(self, config_path: str | Path, config: AppConfig) -> None:
         self.config_path = Path(config_path)
         self.lock = threading.Lock()
+        config.device = resolve_device(config.device)
         self.config = config
         self.model, self.active_model, self.model_fallback = load_yolo_model(config.model)
         self.model_lock = threading.Lock()
@@ -860,6 +893,7 @@ class DashboardState:
     def reconfigure(self, config: AppConfig) -> None:
         with self.lock:
             self.stop_workers()
+            config.device = resolve_device(config.device)
             self.config = config
             self.model, self.active_model, self.model_fallback = load_yolo_model(config.model)
             self.model_lock = threading.Lock()
