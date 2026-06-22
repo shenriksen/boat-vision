@@ -36,6 +36,7 @@ cameras:
       - ship
       - sailboat
       - small_vessel
+      - kayak
       - navigation_buoy
       - red_lateral_mark
       - green_lateral_mark
@@ -54,6 +55,7 @@ cameras:
       - ship
       - sailboat
       - small_vessel
+      - kayak
       - navigation_buoy
       - red_lateral_mark
       - green_lateral_mark
@@ -72,6 +74,7 @@ cameras:
       - ship
       - sailboat
       - small_vessel
+      - kayak
       - navigation_buoy
       - red_lateral_mark
       - green_lateral_mark
@@ -90,6 +93,7 @@ cameras:
       - ship
       - sailboat
       - small_vessel
+      - kayak
       - navigation_buoy
       - red_lateral_mark
       - green_lateral_mark

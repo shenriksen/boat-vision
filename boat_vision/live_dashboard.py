@@ -30,6 +30,7 @@ MARITIME_CLASSES = [
     "ship",
     "sailboat",
     "small_vessel",
+    "kayak",
     "navigation_buoy",
     "red_lateral_mark",
     "green_lateral_mark",
@@ -45,7 +46,7 @@ MARITIME_CLASSES = [
 # work regardless of which model is loaded.
 CLASS_ALIASES = {
     "boat": "boat", "ship": "ship", "sailboat": "sailboat", "sail boat": "sailboat",
-    "small_vessel": "small_vessel", "kayak": "small_vessel",
+    "small_vessel": "small_vessel", "kayak": "kayak",
     "speed boat": "small_vessel", "speedboat": "small_vessel",
     "buoy": "navigation_buoy", "navigation buoy": "navigation_buoy",
     "navigation_buoy": "navigation_buoy", "navigation mark": "navigation_buoy",
@@ -717,6 +718,7 @@ class CameraWorker:
             "ship": "Ship",
             "sailboat": "Sailboat",
             "small_vessel": "Small vessel",
+            "kayak": "Kayak",
             "floating_object": "Object",
             "person": "Person",
         }
@@ -1738,6 +1740,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       'ship',
       'sailboat',
       'small_vessel',
+      'kayak',
       'navigation_buoy',
       'red_lateral_mark',
       'green_lateral_mark',
@@ -1791,6 +1794,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         ship: 'SHIP',
         sailboat: 'SAIL',
         small_vessel: 'SMV',
+        kayak: 'KAYK',
         navigation_buoy: 'BUOY',
         red_lateral_mark: 'RED',
         green_lateral_mark: 'GRN',
@@ -1868,6 +1872,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       ship: 'fa-solid fa-ferry',
       sailboat: 'fa-solid fa-sailboat',
       small_vessel: 'fa-solid fa-ship',
+      kayak: 'fa-solid fa-person-paddling',
       navigation_buoy: 'fa-solid fa-circle-dot',
       red_lateral_mark: 'fa-solid fa-location-dot',
       green_lateral_mark: 'fa-solid fa-location-dot',
@@ -1885,7 +1890,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     function alertCategory(name) {
       if (name === 'person') return 'person';
       if (['navigation_buoy','red_lateral_mark','green_lateral_mark','cardinal_mark','special_mark'].includes(name)) return 'mark';
-      if (['boat','ship','sailboat','small_vessel'].includes(name)) return 'vessel';
+      if (['boat','ship','sailboat','small_vessel','kayak'].includes(name)) return 'vessel';
       return null;
     }
     function checkAlerts(status) {
