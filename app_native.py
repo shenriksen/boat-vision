@@ -132,6 +132,41 @@ def maybe_prompt_update() -> None:
         pass
 
 
+def icon_path() -> Path:
+    try:
+        from boat_vision import live_dashboard as d
+        return Path(d.__file__).resolve().parent / "static" / "app_icon.ico"
+    except Exception:
+        return bundle_dir() / "boat_vision" / "static" / "app_icon.ico"
+
+
+def set_taskbar_icon() -> None:
+    """Give the window (and taskbar) the Boat Vision logo instead of the generic
+    Python icon. Windows-only; runs in a thread and waits for the window."""
+    if os.name != "nt":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NordicUSV.BoatVision")
+    except Exception:
+        pass
+    user32 = ctypes.windll.user32
+    ico = str(icon_path())
+    WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+    IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x0010, 0x0040
+    hicon = user32.LoadImageW(None, ico, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+    if not hicon:
+        return
+    title = f"Boat Vision  v{app_version()}"
+    for _ in range(120):
+        hwnd = user32.FindWindowW(None, title)
+        if hwnd:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+            return
+        time.sleep(0.5)
+
+
 def main() -> int:
     data = data_dir()
     config_path = prepare_data(data)
@@ -147,6 +182,7 @@ def main() -> int:
             time.sleep(0.5)
 
     threading.Thread(target=maybe_prompt_update, daemon=True).start()
+    threading.Thread(target=set_taskbar_icon, daemon=True).start()
 
     # Native window (Edge WebView2). If that is unavailable for any reason,
     # fall back to the default browser so the user still gets the dashboard.
