@@ -2111,6 +2111,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <label>JPEG quality<input id="jpeg-quality" type="number" min="30" max="95" step="1"></label>
           </div>
           <label class="check"><input id="demo-findings" type="checkbox"> Demo maritime findings</label>
+          <label class="check"><input id="color-radar" type="checkbox"> Colour buoy radar (open water only — floods false marks in a marina)</label>
           <label>Event JSONL<input id="output-jsonl"></label>
         </fieldset>
 
@@ -2540,6 +2541,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       $('confidence').value = config.app.confidence_threshold;
       $('jpeg-quality').value = config.app.jpeg_quality;
       $('demo-findings').checked = config.app.demo_findings;
+      $('color-radar').checked = !!config.app.color_buoy_radar;
       $('output-jsonl').value = config.app.output_jsonl;
       $('auto-capture').checked = !!config.app.auto_capture;
       $('auto-capture-interval').value = config.app.auto_capture_interval != null ? config.app.auto_capture_interval : 10;
@@ -2566,6 +2568,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       config.app.confidence_threshold = Number($('confidence').value || 0.35);
       config.app.jpeg_quality = Number($('jpeg-quality').value || 80);
       config.app.demo_findings = $('demo-findings').checked;
+      config.app.color_buoy_radar = $('color-radar').checked;
       config.app.output_jsonl = $('output-jsonl').value.trim() || 'outputs/events/live_detections.jsonl';
       config.app.auto_capture = $('auto-capture').checked;
       config.app.auto_capture_interval = Number($('auto-capture-interval').value || 10);
