@@ -8,6 +8,8 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -387,9 +389,17 @@ class AppConfig:
     auto_capture_interval: float = 10.0
     auto_capture_max: int = 500
     detection_enabled: bool = True
-    inference_cooldown: float = 0.25  # seconds to rest between AI runs (keeps video smooth)
+    inference_cooldown: float = 0.25  # seconds to rest between AI runs (keeps video smooth).
+                                      # LATENCY KNOB: set 0 on GPU for the lowest detection latency.
+    display_jpeg_quality: int = 90    # quality for the live-view JPEG (same level as before, no
+                                      # quality regression). Lower it only if you want to trade a
+                                      # little image quality for faster encode/transfer/decode.
+    profile: bool = False             # record per-stage latency (p50/p95/p99) at /perf.json
     # --- AI-only image processing (never shown to the operator) ---
     ai_enhance: bool = True            # boost saturation + contrast on the frame fed to YOLO
+    ai_max_infer_width: int = 0        # LATENCY KNOB: cap the width of the enhance+inference frame
+                                       # (0 = full res). e.g. 960 cuts enhancement cost a lot; the
+                                       # operator video stays full-res and boxes are scaled back.
     color_buoy_radar: bool = True      # flag vivid red/green/yellow blobs on the water as buoy candidates
     color_buoy_threshold: int = 12     # min local colour-contrast (after top-hat) to count as a candidate
     color_buoy_max: int = 6            # keep only the N strongest candidates per frame (caps clutter)
@@ -450,7 +460,10 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
         auto_capture_max=int(app.get("auto_capture_max", 500)),
         detection_enabled=bool(app.get("detection_enabled", True)),
         inference_cooldown=float(app.get("inference_cooldown", 0.25)),
+        display_jpeg_quality=int(app.get("display_jpeg_quality", 90)),
+        profile=bool(app.get("profile", False)),
         ai_enhance=bool(app.get("ai_enhance", True)),
+        ai_max_infer_width=int(app.get("ai_max_infer_width", 0)),
         color_buoy_radar=bool(app.get("color_buoy_radar", True)),
         color_buoy_threshold=int(app.get("color_buoy_threshold", 12)),
         color_buoy_max=int(app.get("color_buoy_max", 6)),
@@ -491,7 +504,10 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "auto_capture_max": config.auto_capture_max,
             "detection_enabled": config.detection_enabled,
             "inference_cooldown": config.inference_cooldown,
+            "display_jpeg_quality": config.display_jpeg_quality,
+            "profile": config.profile,
             "ai_enhance": config.ai_enhance,
+            "ai_max_infer_width": config.ai_max_infer_width,
             "color_buoy_radar": config.color_buoy_radar,
             "color_buoy_threshold": config.color_buoy_threshold,
             "color_buoy_max": config.color_buoy_max,
@@ -536,6 +552,46 @@ def save_config(path: str | Path, config: AppConfig) -> None:
     Path(path).write_text(yaml.safe_dump(config_to_dict(config), sort_keys=False), encoding="utf-8")
 
 
+class PerfStats:
+    """Rolling per-stage latency stats (milliseconds) with p50/p95/p99.
+
+    Bounded ring buffer per stage so it never grows; thread-safe. Used to MEASURE
+    the live pipeline rather than guess where the latency is. Exposed at /perf.json.
+    """
+
+    def __init__(self, window: int = 240) -> None:
+        self.window = window
+        self._data: Dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def add(self, stage: str, ms: float) -> None:
+        with self._lock:
+            dq = self._data.get(stage)
+            if dq is None:
+                dq = deque(maxlen=self.window)
+                self._data[stage] = dq
+            dq.append(ms)
+
+    def summary(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        with self._lock:
+            for stage, dq in self._data.items():
+                if not dq:
+                    continue
+                xs = sorted(dq)
+                n = len(xs)
+                pick = lambda p: xs[min(n - 1, int(p * n))]  # noqa: E731
+                out[stage] = {
+                    "n": n,
+                    "p50": round(pick(0.50), 1),
+                    "p95": round(pick(0.95), 1),
+                    "p99": round(pick(0.99), 1),
+                    "max": round(xs[-1], 1),
+                    "mean": round(sum(xs) / n, 1),
+                }
+        return out
+
+
 class EventWriter:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
@@ -557,6 +613,7 @@ class LatestFrameReader:
         self.stop_event = threading.Event()
         self.frame: Optional[Any] = None
         self.frame_id = 0
+        self.frame_ts = 0.0  # perf_counter() when this frame was captured (for end-to-end latency)
         self.status = "starting"
         self.thread = threading.Thread(target=self.run, name="latest-frame-reader", daemon=True)
 
@@ -567,11 +624,13 @@ class LatestFrameReader:
         self.stop_event.set()
         self.thread.join(timeout=2.0)
 
-    def snapshot(self) -> tuple[Optional[Any], int, str]:
+    def snapshot(self) -> tuple[Optional[Any], int, str, float]:
+        # No copy: the capture loop always binds a brand-new ndarray (PyAV/OpenCV
+        # return fresh buffers) and never mutates one in place, and no consumer
+        # writes to the shared frame — so returning the reference is safe and saves
+        # a full-frame memcpy on every delivered frame.
         with self.lock:
-            if self.frame is None:
-                return None, self.frame_id, self.status
-            return self.frame.copy(), self.frame_id, self.status
+            return self.frame, self.frame_id, self.status, self.frame_ts
 
     def set_status(self, status: str) -> None:
         with self.lock:
@@ -594,6 +653,7 @@ class LatestFrameReader:
                 with self.lock:
                     self.frame = frame
                     self.frame_id += 1
+                    self.frame_ts = time.perf_counter()
                     self.status = "running"
 
             capture.release()
@@ -621,13 +681,15 @@ class CameraWorker:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.latest_jpeg: Optional[bytes] = None
-        self.latest_raw_jpeg: Optional[bytes] = None
+        self.latest_raw_frame: Optional[Any] = None  # newest raw frame (encoded lazily on demand)
         self.latest_image_size: Optional[tuple[int, int]] = None
         self.latest_events: List[Dict[str, Any]] = []
         self.status = "starting"
         self.frame_index = 0
         self.last_auto_capture = 0.0
         self.infer_input: Optional[Any] = None  # newest frame for the inference thread
+        self.infer_input_ts: float = 0.0        # capture time of infer_input (for end-to-end latency)
+        self.perf = PerfStats()
         self._infer_iter = 0  # inference loop counter (drives profile rotation + tracker steps)
         self.tracker = ObjectTracker(
             start_conf=app.track_start_conf, keep_conf=app.track_keep_conf,
@@ -677,13 +739,32 @@ class CameraWorker:
             "y1": bbox["y1"] / h,
         }
 
+    @contextmanager
+    def _timed(self, stage: str):
+        """Record a stage's wall-clock latency when profiling is on; ~no-op otherwise."""
+        if not self.app.profile:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.perf.add(stage, (time.perf_counter() - start) * 1000.0)
+
     def get_jpeg(self) -> Optional[bytes]:
         with self.lock:
             return self.latest_jpeg
 
     def get_raw_snapshot(self) -> tuple[Optional[bytes], Optional[tuple[int, int]]]:
+        # Encode the raw frame lazily — the editor/auto-capture need it rarely, so we
+        # keep it out of the per-frame display hot path.
         with self.lock:
-            return self.latest_raw_jpeg, self.latest_image_size
+            frame = self.latest_raw_frame
+            size = self.latest_image_size
+        if frame is None:
+            return None, size
+        ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        return (enc.tobytes() if ok else None), size
 
     def run(self) -> None:
         if is_live_source(self.camera.source):
@@ -697,13 +778,13 @@ class CameraWorker:
         last_frame_id = -1
         try:
             while not self.stop_event.is_set():
-                frame, frame_id, status = reader.snapshot()
+                frame, frame_id, status, frame_ts = reader.snapshot()
                 self.set_status(status)
                 if frame is None or frame_id == last_frame_id:
-                    time.sleep(0.01)
+                    time.sleep(0.005)  # short poll: pick up a new frame with minimal added latency
                     continue
                 last_frame_id = frame_id
-                self.show_frame(frame)
+                self.show_frame(frame, frame_ts)
         finally:
             reader.stop()
 
@@ -726,33 +807,37 @@ class CameraWorker:
                         self.set_status("stream lost")
                         break
 
-                self.show_frame(frame)
+                self.show_frame(frame, time.perf_counter())
 
             capture.release()
             time.sleep(1)
 
-    def show_frame(self, frame: Any) -> None:
+    def show_frame(self, frame: Any, capture_ts: float = 0.0) -> None:
         """Display path: encode the newest frame for the live view. This runs at
         camera speed and never waits for AI, so the video stays smooth. The
         detection markers are drawn client-side from `latest_events`, which the
-        inference thread updates independently."""
-        # Display over localhost, so favour quality (>= 90) regardless of the config.
-        quality = max(int(self.app.jpeg_quality), 90)
-        ok, raw_encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-        if not ok:
-            return
-        display_bytes = raw_encoded.tobytes()
+        inference thread updates independently.
+
+        Encodes exactly ONE JPEG per frame: the display image (with the vessel-area
+        overlay only when it's shown). The clean raw frame is kept as an ndarray and
+        encoded lazily in get_raw_snapshot, so the rarely-used editor/auto-capture
+        path stays out of the hot loop."""
+        quality = int(self.app.display_jpeg_quality)
         if (self.camera.ignore_zones or self.camera.ignore_polygons) and self.app.dashboard.show_vessel_area:
             disp = frame.copy()
             self.draw_ignore_zones(disp)
-            ok2, denc = cv2.imencode(".jpg", disp, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-            if ok2:
-                display_bytes = denc.tobytes()
+        else:
+            disp = frame
+        with self._timed("encode"):
+            ok, encoded = cv2.imencode(".jpg", disp, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if not ok:
+            return
         with self.lock:
-            self.latest_raw_jpeg = raw_encoded.tobytes()
-            self.latest_jpeg = display_bytes
+            self.latest_jpeg = encoded.tobytes()
+            self.latest_raw_frame = frame
             self.latest_image_size = (int(frame.shape[1]), int(frame.shape[0]))
             self.infer_input = frame
+            self.infer_input_ts = capture_ts
             self.frame_index += 1
             self.status = "running"
         self.maybe_auto_capture()
@@ -774,15 +859,27 @@ class CameraWorker:
                 continue
             with self.lock:
                 frame = self.infer_input
+                capture_ts = self.infer_input_ts
             if frame is None:
                 time.sleep(0.03)
                 continue
             self._infer_iter += 1
+            # Optional: shrink the frame for the (costly) enhance+inference path. The
+            # operator video stays full-res; YOLO boxes are scaled back below so the
+            # tracker/markers/colour-radar all stay in full-resolution coordinates.
+            scale = 1.0
+            src = frame
+            mw = self.app.ai_max_infer_width
+            if mw and frame.shape[1] > mw:
+                scale = mw / float(frame.shape[1])
+                src = cv2.resize(frame, (mw, max(1, int(round(frame.shape[0] * scale)))),
+                                 interpolation=cv2.INTER_AREA)
             # AI-only enhancement: YOLO sees an auto-levelled, condition-tuned copy
             # (profile rotates each pass); the operator's video is the raw frame.
-            infer_frame = self.enhance_for_ai(frame) if self.app.ai_enhance else frame
+            with self._timed("enhance"):
+                infer_frame = self.enhance_for_ai(src) if self.app.ai_enhance else src
             try:
-                with self.model_lock:
+                with self.model_lock, self._timed("inference"):
                     # Detect at the LOW (keep) threshold so the tracker can sustain
                     # faint objects; the tracker's hysteresis gates what becomes a track.
                     result = self.model.predict(
@@ -799,20 +896,38 @@ class CameraWorker:
                 continue
             # Gather this pass's raw detections from both sources, then let the tracker
             # confirm/hold/coast them (stable IDs, hysteresis, occlusion tolerance).
-            dets = self.events_from_result(result)
-            if self.app.color_buoy_radar:
-                dets.extend(self.color_buoy_candidates(frame, dets))
-            if self.app.demo_findings:
-                dets.extend(self.demo_maritime_events(result.orig_img, len(dets)))
-            events = self.tracker.update(dets, self._infer_iter)
+            with self._timed("postprocess"):
+                dets = self.events_from_result(result)
+                if scale != 1.0:
+                    self._rescale_events(dets, 1.0 / scale, frame.shape[1], frame.shape[0])
+                if self.app.color_buoy_radar:
+                    dets.extend(self.color_buoy_candidates(frame, dets))
+                if self.app.demo_findings:
+                    dets.extend(self.demo_maritime_events(result.orig_img, len(dets)))
+            with self._timed("tracking"):
+                events = self.tracker.update(dets, self._infer_iter)
             self.event_writer.write_many(events)
             with self.lock:
                 self.latest_events = events
+            if self.app.profile and capture_ts:
+                # End-to-end: camera capture -> detection result ready for the UI.
+                self.perf.add("end_to_end", (time.perf_counter() - capture_ts) * 1000.0)
             # Rest between AI runs so the (separate) video pipeline always has CPU.
             # This makes detection a little slower but keeps the video smooth.
             cooldown = getattr(self.app, "inference_cooldown", 0.25)
             if cooldown > 0:
                 time.sleep(cooldown)
+
+    @staticmethod
+    def _rescale_events(events: List[Dict[str, Any]], factor: float, full_w: int, full_h: int) -> None:
+        """Scale detection boxes from the reduced inference frame back to full-res, so
+        everything downstream (tracker, markers, colour radar) shares one coordinate space."""
+        for ev in events:
+            bb = ev["bbox_xyxy"]
+            bb["x1"] *= factor; bb["y1"] *= factor; bb["x2"] *= factor; bb["y2"] *= factor
+            bw = ev["bbox_xywh"]
+            bw["x"] *= factor; bw["y"] *= factor; bw["width"] *= factor; bw["height"] *= factor
+            ev["image_size"] = {"width": int(full_w), "height": int(full_h)}
 
     def current_enhance_profile(self) -> str:
         """The profile this inference pass uses. Rotates per pass so that across one
@@ -1295,6 +1410,14 @@ class DashboardState:
             save_config(self.config_path, config)
             self.start_workers()
 
+    def perf_payload(self) -> Dict[str, Any]:
+        """Per-camera latency stats (ms, p50/p95/p99). Empty unless `profile: true`."""
+        with self.lock:
+            return {
+                "profiling": self.config.profile,
+                "cameras": {cid: w.perf.summary() for cid, w in self.workers.items()},
+            }
+
     def status_payload(self) -> Dict[str, Any]:
         with self.lock:
             active = [worker.snapshot() for worker in self.workers.values()]
@@ -1344,6 +1467,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(self.state().status_payload())
         elif parsed.path == "/config.json":
             self.send_json(config_to_dict(self.state().config))
+        elif parsed.path == "/perf.json":
+            self.send_json(self.state().perf_payload())
         elif parsed.path == "/stream.mjpg":
             camera_id = parse_qs(parsed.query).get("camera_id", [""])[0]
             self.send_mjpeg(camera_id)

@@ -17,6 +17,14 @@ app:
   auto_capture: false
   auto_capture_interval: 10
   auto_capture_max: 500
+  # --- Latency knobs (low-latency live feed) ---
+  inference_cooldown: 0.25  # rest between AI passes; set 0 on GPU for lowest detection latency
+  display_jpeg_quality: 90  # live-view JPEG quality (same as before — no quality regression);
+                            # lower only if you want faster encode/transfer at some image cost
+  ai_max_infer_width: 0     # OPT-IN: cap the enhance+inference frame width (e.g. 960). 0 = full res.
+                            # Operator video stays full-res; detection boxes are scaled back.
+                            # Off by default so small/distant objects stay as detectable as now.
+  profile: false            # expose per-stage latency (p50/p95/p99) at GET /perf.json
   # AI-only image processing (the operator always sees the clean, raw video).
   ai_enhance: true          # auto-level exposure + rotate day/low-light/anti-glare/haze
                             # profiles so changing weather/light can't blind the AI
