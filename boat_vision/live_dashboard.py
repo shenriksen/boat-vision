@@ -391,6 +391,9 @@ class AppConfig:
     detection_enabled: bool = True
     inference_cooldown: float = 0.25  # seconds to rest between AI runs (keeps video smooth).
                                       # LATENCY KNOB: set 0 on GPU for the lowest detection latency.
+    video_mode: str = "mjpeg"         # "mjpeg" = push frames as a smooth stream (like VLC);
+                                      # "snapshot" = poll still images (fallback for renderers that
+                                      # can't show MJPEG). The UI auto-falls back if a stream errors.
     display_jpeg_quality: int = 90    # quality for the live-view JPEG (same level as before, no
                                       # quality regression). Lower it only if you want to trade a
                                       # little image quality for faster encode/transfer/decode.
@@ -405,6 +408,9 @@ class AppConfig:
                                        # a marina (colourful boats/fenders), so OFF by default.
     color_buoy_threshold: int = 12     # min local colour-contrast (after top-hat) to count as a candidate
     color_buoy_max: int = 6            # keep only the N strongest candidates per frame (caps clutter)
+    color_buoy_isolation: int = 10     # max colourfulness allowed in the ring AROUND a candidate. A real
+                                       # buoy sits on (plain) water; reject blobs surrounded by other
+                                       # colourful stuff (marina clutter). Lower = stricter.
     # --- Multi-object tracking with confidence hysteresis (stable live detection) ---
     track_start_conf: float = 0.60     # hysteresis HIGH: confidence needed to START a new track
     track_keep_conf: float = 0.35      # hysteresis LOW: confidence needed to SUSTAIN an existing track
@@ -462,6 +468,7 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
         auto_capture_max=int(app.get("auto_capture_max", 500)),
         detection_enabled=bool(app.get("detection_enabled", True)),
         inference_cooldown=float(app.get("inference_cooldown", 0.25)),
+        video_mode=str(app.get("video_mode", "mjpeg")),
         display_jpeg_quality=int(app.get("display_jpeg_quality", 90)),
         profile=bool(app.get("profile", False)),
         ai_enhance=bool(app.get("ai_enhance", True)),
@@ -469,6 +476,7 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
         color_buoy_radar=bool(app.get("color_buoy_radar", False)),
         color_buoy_threshold=int(app.get("color_buoy_threshold", 12)),
         color_buoy_max=int(app.get("color_buoy_max", 6)),
+        color_buoy_isolation=int(app.get("color_buoy_isolation", 10)),
         track_start_conf=float(app.get("track_start_conf", 0.60)),
         track_keep_conf=float(app.get("track_keep_conf", 0.35)),
         track_confirm_hits=int(app.get("track_confirm_hits", 3)),
@@ -506,6 +514,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "auto_capture_max": config.auto_capture_max,
             "detection_enabled": config.detection_enabled,
             "inference_cooldown": config.inference_cooldown,
+            "video_mode": config.video_mode,
             "display_jpeg_quality": config.display_jpeg_quality,
             "profile": config.profile,
             "ai_enhance": config.ai_enhance,
@@ -513,6 +522,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "color_buoy_radar": config.color_buoy_radar,
             "color_buoy_threshold": config.color_buoy_threshold,
             "color_buoy_max": config.color_buoy_max,
+            "color_buoy_isolation": config.color_buoy_isolation,
             "track_start_conf": config.track_start_conf,
             "track_keep_conf": config.track_keep_conf,
             "track_confirm_hits": config.track_confirm_hits,
@@ -760,6 +770,10 @@ class CameraWorker:
         with self.lock:
             return self.latest_jpeg
 
+    def get_jpeg_indexed(self) -> tuple[Optional[bytes], int]:
+        with self.lock:
+            return self.latest_jpeg, self.frame_index
+
     def get_raw_snapshot(self) -> tuple[Optional[bytes], Optional[tuple[int, int]]]:
         # Encode the raw frame lazily — the editor/auto-capture need it rarely, so we
         # keep it out of the per-frame display hot path.
@@ -993,11 +1007,11 @@ class CameraWorker:
         redness = r - np.maximum(g, b)
         greenness = g - np.maximum(r, b)
         yellowness = np.minimum(r, g) - b
-        colorful = np.clip(np.maximum.reduce([redness, greenness, yellowness]), 0, 255).astype(np.uint8)
+        colorful_raw = np.clip(np.maximum.reduce([redness, greenness, yellowness]), 0, 255).astype(np.uint8)
         # Top-hat keeps small LOCAL colour peaks (buoys) and removes broad texture/
         # gradients (water sheen, moiré from filming a screen) — a buoy is a dot, not a wash.
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        colorful = cv2.morphologyEx(colorful, cv2.MORPH_TOPHAT, kernel)
+        colorful = cv2.morphologyEx(colorful_raw, cv2.MORPH_TOPHAT, kernel)
         # Only look at the open-water band: skip sky/land (top) and own deck (bottom).
         band = np.zeros((height, width), np.uint8)
         band[int(0.28 * height):int(0.80 * height), :] = 255
@@ -1020,6 +1034,19 @@ class CameraWorker:
             cx, cy = x + w / 2.0, y + h / 2.0
             if in_yolo_box(cx, cy):  # already named by the net
                 continue
+            # Isolation: a real buoy sits on plain water, so the ring around it should be
+            # nearly colourless. Reject blobs surrounded by other colourful stuff (a boat
+            # hull, fenders, dock gear) — that is what floods false marks in a marina.
+            m = int(max(8, 2 * max(w, h)))
+            ox1, oy1 = max(0, x - m), max(0, y - m)
+            ox2, oy2 = min(width, x + w + m), min(height, y + h + m)
+            outer = colorful_raw[oy1:oy2, ox1:ox2]
+            inner = colorful_raw[y:y + h, x:x + w]
+            ring_n = outer.size - inner.size
+            if ring_n > 0:
+                ring_mean = (int(outer.sum()) - int(inner.sum())) / ring_n
+                if ring_mean > self.app.color_buoy_isolation:
+                    continue
             peak = int(colorful[y:y + h, x:x + w].max())
             detections.append((cx, cy, w, h, peak))
         # Keep only the strongest few candidates per frame so noise can't flood the view.
@@ -1504,6 +1531,7 @@ class DashboardState:
                     "show_events": self.config.dashboard.show_events,
                     "card_min_width": self.config.dashboard.card_min_width,
                     "view_mode": self.config.dashboard.view_mode,
+                    "video_mode": self.config.video_mode,
                 },
                 "cameras": active + inactive,
             }
@@ -1651,24 +1679,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(HTTPStatus.OK)
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-cache, private")
         self.send_header("Pragma", "no-cache")
+        self.send_header("Connection", "close")
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.end_headers()
 
+        # Push each NEW frame as soon as it's ready (no fixed 20fps cap, no duplicate
+        # frames) so the live view is as smooth as the camera delivers — like VLC.
+        last_idx = -1
         while True:
-            frame = worker.get_jpeg()
-            if frame is None:
-                time.sleep(0.2)
+            frame, idx = worker.get_jpeg_indexed()
+            if frame is None or idx == last_idx:
+                time.sleep(0.004)  # wait for the next captured frame
                 continue
+            last_idx = idx
             try:
-                self.wfile.write(b"--frame\r\n")
-                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
                 self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
                 self.wfile.write(frame)
                 self.wfile.write(b"\r\n")
-                time.sleep(0.05)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 break
 
     def send_snapshot(self, camera_id: str) -> None:
@@ -2524,7 +2555,9 @@ DASHBOARD_HTML = r"""<!doctype html>
       }).join('');
     }
 
+    let lastStatus = null;
     function updateCameraCards(status) {
+      lastStatus = status;
       if (typeof status.detection_enabled === 'boolean') reflectAi(status.detection_enabled);
       checkAlerts(status);
       renderCameraCards(status);
@@ -2540,24 +2573,48 @@ DASHBOARD_HTML = r"""<!doctype html>
           aiBtn.classList.toggle('off', camera.detect === false);
           aiBtn.querySelector('.cam-ai-label').textContent = camera.detect === false ? 'AI off' : 'AI';
         }
-        const img = card.querySelector('img');
         if (camera.status !== 'disabled') {
-          liveCameras.add(camera.camera_id);
+          startVideo(card, camera.camera_id);
         } else {
-          liveCameras.delete(camera.camera_id);
-          img.removeAttribute('src');
+          stopVideo(card, camera.camera_id);
         }
         renderMarkers(card, camera);
         card.querySelector('pre').textContent = camera.events.map(eventLine).join('\n');
       }
     }
 
-    // Show video by rapidly refreshing a still image. This works in every
-    // renderer (browser AND the native window's WebView2, which does not render
-    // multipart MJPEG streams). Double-buffered to avoid flicker.
-    const liveCameras = new Set();
+    // Live video. Default: a continuous MJPEG stream (server pushes each new frame =
+    // smooth, like VLC, no per-frame HTTP round-trips). Falls back to snapshot polling
+    // automatically if a stream errors a few times (e.g. a renderer that can't show
+    // MJPEG), or immediately when video_mode is "snapshot".
+    const pollSet = new Set();          // cameras using the snapshot-polling fallback
+    const videoMode = {};               // cameraId -> 'mjpeg' | 'poll'
+    const videoErrors = {};
+    function forcedSnapshot() {
+      return lastStatus && lastStatus.dashboard && lastStatus.dashboard.video_mode === 'snapshot';
+    }
+    function startVideo(card, id) {
+      const img = card.querySelector('img');
+      if (videoMode[id] === 'poll' || forcedSnapshot()) { pollSet.add(id); return; }
+      if (img.dataset.stream === id) return;   // already streaming
+      img.dataset.stream = id;
+      img.onerror = () => {
+        videoErrors[id] = (videoErrors[id] || 0) + 1;
+        if (videoErrors[id] >= 3) {            // give up on MJPEG, poll instead
+          videoMode[id] = 'poll'; img.onerror = null; img.dataset.stream = ''; pollSet.add(id);
+        } else {                               // transient (e.g. worker restarted): reconnect
+          setTimeout(() => { img.src = `/stream.mjpg?camera_id=${encodeURIComponent(id)}&_=${Date.now()}`; }, 700);
+        }
+      };
+      img.src = `/stream.mjpg?camera_id=${encodeURIComponent(id)}`;
+    }
+    function stopVideo(card, id) {
+      const img = card.querySelector('img');
+      img.onerror = null; img.dataset.stream = ''; img.removeAttribute('src');
+      pollSet.delete(id);
+    }
     function pollImages() {
-      for (const id of liveCameras) {
+      for (const id of pollSet) {
         const card = document.querySelector(`.camera[data-camera-id="${CSS.escape(id)}"]`);
         if (!card) continue;
         const img = card.querySelector('img');

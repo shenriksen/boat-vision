@@ -18,6 +18,7 @@ app:
   auto_capture_interval: 10
   auto_capture_max: 500
   # --- Latency knobs (low-latency live feed) ---
+  video_mode: mjpeg         # "mjpeg" = smooth pushed stream (like VLC); "snapshot" = polled stills
   inference_cooldown: 0.25  # rest between AI passes; set 0 on GPU for lowest detection latency
   display_jpeg_quality: 90  # live-view JPEG quality (same as before — no quality regression);
                             # lower only if you want faster encode/transfer at some image cost
@@ -32,6 +33,8 @@ app:
                             # but floods false "seamarks" in a marina — turn on only offshore.
   color_buoy_threshold: 12  # min local colour-contrast to count (lower = more sensitive)
   color_buoy_max: 6         # keep only the N strongest colour candidates per frame
+  color_buoy_isolation: 10  # reject colour blobs whose surroundings are also colourful (marina
+                            # clutter); a real buoy sits on plain water. Lower = stricter.
   # Tracking with confidence hysteresis — stable live detection (no flicker, holds
   # through brief occlusions). High bar to start a track, low bar to keep it.
   track_start_conf: 0.60    # confidence needed to START a new track
