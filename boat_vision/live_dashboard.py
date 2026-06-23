@@ -1413,10 +1413,16 @@ class DashboardState:
             self.start_workers()
 
     def perf_payload(self) -> Dict[str, Any]:
-        """Per-camera latency stats (ms, p50/p95/p99). Empty unless `profile: true`."""
+        """Per-camera latency stats (ms, p50/p95/p99). Empty unless `profile: true`.
+        Also reports the resolved device so you can confirm GPU vs CPU at a glance."""
         with self.lock:
+            device = self.config.device
             return {
                 "profiling": self.config.profile,
+                "device": device,
+                "device_label": "GPU (CUDA)" if str(device).isdigit() else f"CPU/{device}",
+                "model": self.active_model,
+                "model_fallback": self.model_fallback,
                 "cameras": {cid: w.perf.summary() for cid, w in self.workers.items()},
             }
 
