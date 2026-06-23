@@ -682,6 +682,8 @@ class CameraWorker:
         self.event_writer = event_writer
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.paused = threading.Event()      # pause/play the live stream for this feed
+        self.reconnect = threading.Event()   # one-shot: drop & reopen the stream (refresh)
         self.latest_jpeg: Optional[bytes] = None
         self.latest_raw_frame: Optional[Any] = None  # newest raw frame (encoded lazily on demand)
         self.latest_image_size: Optional[tuple[int, int]] = None
@@ -722,6 +724,7 @@ class CameraWorker:
                 "source": masked_source(self.camera.source),
                 "status": self.status,
                 "detect": self.camera.detect,
+                "paused": self.paused.is_set(),
                 "frame_index": self.frame_index,
                 "events": self.latest_events[-10:],
                 "detections": detections,
@@ -775,11 +778,27 @@ class CameraWorker:
             self.run_recorded_source()
 
     def run_live_source(self) -> None:
-        reader = LatestFrameReader(self.camera.source)
-        reader.start()
+        reader: Optional[LatestFrameReader] = None
         last_frame_id = -1
         try:
             while not self.stop_event.is_set():
+                # Paused: drop the connection (truly stops the stream) and freeze the
+                # last frame until play. Refresh (reconnect) also drops the reader so
+                # the next loop reopens a fresh stream.
+                if self.paused.is_set():
+                    if reader is not None:
+                        reader.stop(); reader = None
+                        self.set_status("paused")
+                    time.sleep(0.1)
+                    continue
+                if self.reconnect.is_set():
+                    self.reconnect.clear()
+                    if reader is not None:
+                        reader.stop(); reader = None
+                if reader is None:
+                    reader = LatestFrameReader(self.camera.source)
+                    reader.start()
+                    last_frame_id = -1
                 frame, frame_id, status, frame_ts = reader.snapshot()
                 self.set_status(status)
                 if frame is None or frame_id == last_frame_id:
@@ -788,7 +807,8 @@ class CameraWorker:
                 last_frame_id = frame_id
                 self.show_frame(frame, frame_ts)
         finally:
-            reader.stop()
+            if reader is not None:
+                reader.stop()
 
     def run_recorded_source(self) -> None:
         while not self.stop_event.is_set():
@@ -800,6 +820,13 @@ class CameraWorker:
 
             self.set_status("running")
             while not self.stop_event.is_set():
+                if self.paused.is_set():
+                    self.set_status("paused")
+                    time.sleep(0.1)
+                    continue
+                if self.reconnect.is_set():
+                    self.reconnect.clear()
+                    break  # reopen the source from the top (refresh)
                 ok, frame = capture.read()
                 if not ok:
                     # Local video files loop continuously for a live-style demo.
@@ -812,7 +839,7 @@ class CameraWorker:
                 self.show_frame(frame, time.perf_counter())
 
             capture.release()
-            time.sleep(1)
+            time.sleep(0.3)
 
     def show_frame(self, frame: Any, capture_ts: float = 0.0) -> None:
         """Display path: encode the newest frame for the live view. This runs at
@@ -848,6 +875,11 @@ class CameraWorker:
         """Inference path: continuously analyse the newest frame, at whatever
         speed the hardware allows, without blocking the live video."""
         while not self.stop_event.is_set():
+            # Stream paused: stop analysing (the video is frozen); keep the last
+            # markers so they stay on the frozen frame.
+            if self.paused.is_set():
+                time.sleep(0.1)
+                continue
             # AI is paused for this feed if either the global toggle is off OR this
             # camera's own AI toggle is off.
             global_off = self.detect_flag is not None and not self.detect_flag.is_set()
@@ -1369,6 +1401,23 @@ class DashboardState:
             save_config(self.config_path, self.config)
         return enabled
 
+    def control_camera(self, camera_id: str, action: str) -> Optional[Dict[str, Any]]:
+        """Pause / play / refresh (reconnect) a single feed's stream."""
+        with self.lock:
+            worker = self.workers.get(camera_id)
+            if worker is None:
+                return None
+            if action == "pause":
+                worker.paused.set()
+            elif action == "play":
+                worker.paused.clear()
+            elif action == "refresh":
+                worker.paused.clear()      # ensure it's running
+                worker.reconnect.set()      # drop & reopen the stream
+            else:
+                return {"error": "unknown action"}
+            return {"camera_id": camera_id, "action": action, "paused": worker.paused.is_set()}
+
     def start_workers(self) -> None:
         self.workers = {
             camera.camera_id: CameraWorker(
@@ -1525,6 +1574,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/capture.json":
             self.capture_frames()
+            return
+        if parsed.path == "/camera_control.json":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                camera_id = str(payload.get("camera_id", ""))
+                action = str(payload.get("action", ""))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            result = self.state().control_camera(camera_id, action)
+            if result is None:
+                self.send_json({"ok": False, "error": "unknown camera_id"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self.send_json({"ok": True, **result})
             return
         if parsed.path == "/detection.json":
             try:
@@ -2050,6 +2114,18 @@ DASHBOARD_HTML = r"""<!doctype html>
       pointer-events: none; transition: opacity 200ms ease; }
     #settings-scrim.open { opacity: 1; pointer-events: auto; }
 
+    /* Right-click camera menu */
+    .cam-menu { position: fixed; z-index: 90; min-width: 168px; padding: 6px; display: none;
+      background: rgba(255,255,255,0.97); border: 1px solid rgba(209,216,224,0.95); border-radius: 12px;
+      box-shadow: 0 12px 32px rgba(8,15,22,0.28); backdrop-filter: blur(14px) saturate(1.2); }
+    .cam-menu.open { display: block; }
+    .cam-menu button { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+      background: transparent; border: 0; color: #0e1a24; font: inherit; font-size: 13px; font-weight: 600;
+      padding: 9px 12px; border-radius: 8px; cursor: pointer; }
+    .cam-menu button:hover { background: rgba(14,26,36,0.07); }
+    .cam-menu button i { width: 16px; text-align: center; color: #51606e; }
+    .cam-menu .sep { height: 1px; margin: 5px 6px; background: rgba(209,216,224,0.8); }
+
     /* Capture toast */
     .toast { position: fixed; z-index: 80; left: 50%; bottom: 28px; transform: translateX(-50%) translateY(20px);
       background: rgba(14,26,36,0.92); color: #fff; padding: 11px 18px; border-radius: 999px; font-size: 13px;
@@ -2072,6 +2148,12 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
     </div>
     <div id="toast" class="toast"></div>
+    <div id="cam-menu" class="cam-menu">
+      <button data-action="pause"><i class="fa-solid fa-pause"></i> Pause</button>
+      <button data-action="play"><i class="fa-solid fa-play"></i> Play</button>
+      <div class="sep"></div>
+      <button data-action="refresh"><i class="fa-solid fa-rotate-right"></i> Refresh stream</button>
+    </div>
     <div id="display-pop" class="display-pop">
       <div>
         <h4>☀ Brilliance</h4>
@@ -2929,6 +3011,46 @@ DASHBOARD_HTML = r"""<!doctype html>
     $('brilliance').addEventListener('input', (e) => applyBrilliance(e.target.value));
     applyTheme(localStorage.getItem('bv-theme') || 'day');
     applyBrilliance(localStorage.getItem('bv-brilliance') || 100);
+
+    // ---- Right-click camera menu: Pause / Play / Refresh ----
+    (function () {
+      const menu = $('cam-menu');
+      let activeCamera = null;
+      function closeMenu() { menu.classList.remove('open'); activeCamera = null; }
+      function openMenu(x, y, cameraId) {
+        activeCamera = cameraId;
+        menu.classList.add('open');
+        // keep the menu on-screen
+        const w = menu.offsetWidth || 180, h = menu.offsetHeight || 140;
+        menu.style.left = Math.min(x, window.innerWidth - w - 8) + 'px';
+        menu.style.top = Math.min(y, window.innerHeight - h - 8) + 'px';
+      }
+      $('camera-grid').addEventListener('contextmenu', (e) => {
+        const card = e.target.closest('.camera');
+        if (!card) return;
+        e.preventDefault();
+        openMenu(e.clientX, e.clientY, card.dataset.cameraId);
+      });
+      menu.addEventListener('click', async (e) => {
+        const btn = e.target.closest('button');
+        if (!btn || !activeCamera) return;
+        const action = btn.dataset.action;
+        const camId = activeCamera;
+        closeMenu();
+        try {
+          const res = await fetch('/camera_control.json', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({camera_id: camId, action}),
+          });
+          const r = await res.json();
+          if (r.ok) showToast(action === 'pause' ? 'Stream paused' : action === 'play' ? 'Stream playing' : 'Stream refreshed');
+        } catch (err) {}
+      });
+      // dismiss on any outside click, scroll or Escape
+      document.addEventListener('click', (e) => { if (!menu.contains(e.target)) closeMenu(); });
+      window.addEventListener('blur', closeMenu);
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
+    })();
 
     loadConfig().then(() => {
       refreshStatus();
