@@ -28,7 +28,8 @@ app:
   # AI-only image processing (the operator always sees the clean, raw video).
   ai_enhance: true          # auto-level exposure + rotate day/low-light/anti-glare/haze
                             # profiles so changing weather/light can't blind the AI
-  color_buoy_radar: true    # flag vivid red/green/yellow blobs on the water as buoys
+  color_buoy_radar: false   # OPT-IN: vivid-colour buoy radar. Good for a lone buoy in open water,
+                            # but floods false "seamarks" in a marina — turn on only offshore.
   color_buoy_threshold: 12  # min local colour-contrast to count (lower = more sensitive)
   color_buoy_max: 6         # keep only the N strongest colour candidates per frame
   # Tracking with confidence hysteresis — stable live detection (no flicker, holds

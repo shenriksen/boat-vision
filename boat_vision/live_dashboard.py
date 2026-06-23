@@ -400,7 +400,9 @@ class AppConfig:
     ai_max_infer_width: int = 0        # LATENCY KNOB: cap the width of the enhance+inference frame
                                        # (0 = full res). e.g. 960 cuts enhancement cost a lot; the
                                        # operator video stays full-res and boxes are scaled back.
-    color_buoy_radar: bool = True      # flag vivid red/green/yellow blobs on the water as buoy candidates
+    color_buoy_radar: bool = False     # OPT-IN: flag vivid colour blobs on the water as buoys. Great
+                                       # for a lone buoy in open water, but floods false "seamarks" in
+                                       # a marina (colourful boats/fenders), so OFF by default.
     color_buoy_threshold: int = 12     # min local colour-contrast (after top-hat) to count as a candidate
     color_buoy_max: int = 6            # keep only the N strongest candidates per frame (caps clutter)
     # --- Multi-object tracking with confidence hysteresis (stable live detection) ---
@@ -464,7 +466,7 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
         profile=bool(app.get("profile", False)),
         ai_enhance=bool(app.get("ai_enhance", True)),
         ai_max_infer_width=int(app.get("ai_max_infer_width", 0)),
-        color_buoy_radar=bool(app.get("color_buoy_radar", True)),
+        color_buoy_radar=bool(app.get("color_buoy_radar", False)),
         color_buoy_threshold=int(app.get("color_buoy_threshold", 12)),
         color_buoy_max=int(app.get("color_buoy_max", 6)),
         track_start_conf=float(app.get("track_start_conf", 0.60)),
