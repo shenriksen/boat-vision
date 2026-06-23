@@ -3,8 +3,9 @@
 # https://universe.roboflow.com/lyx-limyixian-gmail-com/singapore-maritime/dataset/5
 #
 # Used to bootstrap a buoy/boat detector before fine-tuning on Nordic USV's own
-# footage. Paths are absolute so Ultralytics resolves them regardless of cwd.
-path: /Users/sanderhenriksen/conductor/workspaces/Quickstart/rome/data/datasets/_downloads/singapore_maritime_v5
+# footage. `path` is relative to the repo root; boat_vision.train resolves it to an
+# absolute path at runtime so it works on any machine (Mac dev, Windows boat PC, CI).
+path: data/datasets/_downloads/singapore_maritime_v5
 train: train/images
 val: valid/images
 test: test/images

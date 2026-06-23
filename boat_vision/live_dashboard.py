@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 import cv2
+import numpy as np
 import yaml
 from ultralytics import YOLO
 
@@ -80,6 +81,149 @@ def class_list(value: Any) -> Optional[List[str]]:
 def is_live_source(source: str) -> bool:
     lowered = source.lower()
     return source.isdigit() or lowered.startswith(("rtsp://", "http://", "https://"))
+
+
+# --- AI-only image enhancement -------------------------------------------------
+# A single fixed setting can't cope with sun, dusk, rain and haze, so the AI
+# auto-levels exposure and rotates through several condition-tuned profiles
+# (one per frame). An object invisible under one profile pops under another, and
+# an area is only "clear" once it's been checked under all of them. None of this
+# is ever shown to the operator — it feeds inference only.
+ENHANCE_PROFILES = ("neutral", "low_light", "anti_glare", "haze_rain")
+
+
+def _apply_gamma(img: Any, g: float) -> Any:
+    lut = np.array([((i / 255.0) ** g) * 255 for i in range(256)], dtype=np.uint8)
+    return cv2.LUT(img, lut)
+
+
+def _auto_level(img: Any) -> Any:
+    """Normalise exposure via a percentile stretch so dark, bright and hazy frames
+    all land in a consistent range before the per-condition profile is applied."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lo, hi = np.percentile(gray, 2), np.percentile(gray, 98)
+    if hi - lo < 10:
+        return img
+    return np.clip((img.astype(np.float32) - lo) * 255.0 / (hi - lo), 0, 255).astype(np.uint8)
+
+
+def _boost_saturation(img: Any, factor: float) -> Any:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * factor, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def _clahe(img: Any, clip: float) -> Any:
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def _dehaze(img: Any) -> Any:
+    """Subtract the atmospheric 'veil' (smoothed dark channel) to cut rain/fog/glare haze."""
+    veil = cv2.min(cv2.min(img[..., 0], img[..., 1]), img[..., 2])
+    veil = cv2.GaussianBlur(veil, (0, 0), 20)
+    return np.clip(img.astype(np.int16) - 0.6 * veil[..., None], 0, 255).astype(np.uint8)
+
+
+def enhance_for_profile(frame: Any, profile: str) -> Any:
+    """Auto-level then apply one condition-tuned enhancement profile. AI-input only."""
+    img = _auto_level(frame)
+    if profile == "low_light":      # dusk / night: brighten + strong local contrast
+        return _clahe(_boost_saturation(_apply_gamma(img, 0.55), 1.5), 3.0)
+    if profile == "anti_glare":     # bright sun: pull down highlights, lift colour
+        return _clahe(_boost_saturation(_apply_gamma(img, 1.4), 1.3), 2.0)
+    if profile == "haze_rain":      # fog / rain / spray: dehaze + heavy contrast
+        return _clahe(_boost_saturation(_dehaze(img), 1.6), 4.0)
+    return _clahe(_boost_saturation(img, 1.4), 2.0)  # neutral daylight
+
+
+class ObjectTracker:
+    """Lightweight per-camera multi-object tracker. Gives the live-feed benefits of
+    ByteTrack/BoT-SORT — stable IDs, no flickering boxes, tolerance of short occlusions
+    — but fits our shared-model pipeline (Ultralytics' built-in tracker keeps state
+    inside the model, which would collide across cameras). It works on detection
+    *event dicts* from any source (YOLO or the colour buoy radar), with:
+      - confidence hysteresis: a HIGH bar to START a track, a LOW bar to KEEP it;
+      - N-of-M confirmation before a track is reported (kills one-frame false hits);
+      - a coast buffer so a briefly-lost object isn't dropped mid-occlusion.
+    """
+
+    def __init__(self, start_conf: float, keep_conf: float, confirm_hits: int,
+                 confirm_window: int, buffer_frames: int, match_dist: float) -> None:
+        self.start_conf = start_conf
+        self.keep_conf = keep_conf
+        self.confirm_hits = max(1, confirm_hits)
+        self.confirm_window = max(self.confirm_hits, confirm_window)
+        self.buffer = max(0, buffer_frames)
+        self.match_dist = match_dist
+        self.tracks: List[Dict[str, Any]] = []
+        self._next_id = 1
+
+    @staticmethod
+    def _center(ev: Dict[str, Any]) -> tuple[float, float]:
+        b = ev["bbox_xyxy"]
+        return (b["x1"] + b["x2"]) / 2.0, (b["y1"] + b["y2"]) / 2.0
+
+    def update(self, dets: List[Dict[str, Any]], step: int) -> List[Dict[str, Any]]:
+        width = dets[0]["image_size"]["width"] if dets else 1
+        tol = self.match_dist * max(1, width) if self.match_dist <= 1 else self.match_dist
+        used: set[int] = set()
+
+        # 1) Sustain existing tracks: match to the nearest same-class detection that
+        #    clears the LOW (keep) threshold — easy to hold, hard to start.
+        for t in self.tracks:
+            tcx, tcy = self._center(t["event"])
+            best, best_d = None, 1e18
+            for i, ev in enumerate(dets):
+                if i in used or ev["class_name"] != t["class_name"] or ev["confidence"] < self.keep_conf:
+                    continue
+                cx, cy = self._center(ev)
+                if abs(cx - tcx) <= tol and abs(cy - tcy) <= tol:
+                    d = abs(cx - tcx) + abs(cy - tcy)
+                    if d < best_d:
+                        best, best_d = i, d
+            if best is not None:
+                used.add(best)
+                t["event"] = dets[best]
+                t["misses"] = 0
+                t["hits"].append(step)
+                t["last"] = step
+            else:
+                t["misses"] += 1
+
+        # 2) Start new tracks only from strong, unmatched detections (HIGH threshold).
+        for i, ev in enumerate(dets):
+            if i in used or ev["confidence"] < self.start_conf:
+                continue
+            self.tracks.append({
+                "id": self._next_id, "class_name": ev["class_name"], "event": ev,
+                "hits": [step], "misses": 0, "last": step, "confirmed": False,
+            })
+            self._next_id += 1
+
+        # 3) Retire dead tracks; trim hit history to the confirmation window.
+        alive = []
+        for t in self.tracks:
+            if t["misses"] > self.buffer:
+                continue
+            t["hits"] = [h for h in t["hits"] if step - h < self.confirm_window]
+            if len(t["hits"]) >= self.confirm_hits:
+                t["confirmed"] = True  # sticky: stays reported while it coasts
+            alive.append(t)
+        self.tracks = alive
+
+        # 4) Report confirmed tracks (whether currently seen or coasting through occlusion).
+        out = []
+        for t in self.tracks:
+            if not t["confirmed"]:
+                continue
+            ev = dict(t["event"])
+            ev["tracking_id"] = t["id"]
+            ev["coasting"] = t["misses"] > 0
+            out.append(ev)
+        return out
 
 
 class PyAvCapture:
@@ -211,6 +355,7 @@ class CameraConfig:
     allowed_classes: Optional[List[str]]
     ignore_zones: List[Dict[str, float]]
     ignore_polygons: List[List[Dict[str, float]]] = None
+    detect: bool = True  # per-camera AI on/off (independent of the global toggle)
 
 
 @dataclass
@@ -243,6 +388,18 @@ class AppConfig:
     auto_capture_max: int = 500
     detection_enabled: bool = True
     inference_cooldown: float = 0.25  # seconds to rest between AI runs (keeps video smooth)
+    # --- AI-only image processing (never shown to the operator) ---
+    ai_enhance: bool = True            # boost saturation + contrast on the frame fed to YOLO
+    color_buoy_radar: bool = True      # flag vivid red/green/yellow blobs on the water as buoy candidates
+    color_buoy_threshold: int = 12     # min local colour-contrast (after top-hat) to count as a candidate
+    color_buoy_max: int = 6            # keep only the N strongest candidates per frame (caps clutter)
+    # --- Multi-object tracking with confidence hysteresis (stable live detection) ---
+    track_start_conf: float = 0.60     # hysteresis HIGH: confidence needed to START a new track
+    track_keep_conf: float = 0.35      # hysteresis LOW: confidence needed to SUSTAIN an existing track
+    track_confirm_hits: int = 3        # must be seen in N of the last `track_confirm_window` passes to alarm
+    track_confirm_window: int = 5
+    track_buffer: int = 15             # keep coasting a lost track this many passes (tolerate occlusion)
+    track_match_dist: float = 0.06     # max centre move to match a track (fraction of frame width)
 
 
 def config_from_dict(data: Dict[str, Any]) -> AppConfig:
@@ -254,6 +411,7 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
             name=str(camera.get("name") or camera["camera_id"]).strip(),
             source=str(camera["source"]).strip(),
             enabled=bool(camera.get("enabled", True)),
+            detect=bool(camera.get("detect", True)),
             allowed_classes=class_list(camera.get("allowed_classes")),
             ignore_zones=[
                 {
@@ -292,6 +450,16 @@ def config_from_dict(data: Dict[str, Any]) -> AppConfig:
         auto_capture_max=int(app.get("auto_capture_max", 500)),
         detection_enabled=bool(app.get("detection_enabled", True)),
         inference_cooldown=float(app.get("inference_cooldown", 0.25)),
+        ai_enhance=bool(app.get("ai_enhance", True)),
+        color_buoy_radar=bool(app.get("color_buoy_radar", True)),
+        color_buoy_threshold=int(app.get("color_buoy_threshold", 12)),
+        color_buoy_max=int(app.get("color_buoy_max", 6)),
+        track_start_conf=float(app.get("track_start_conf", 0.60)),
+        track_keep_conf=float(app.get("track_keep_conf", 0.35)),
+        track_confirm_hits=int(app.get("track_confirm_hits", 3)),
+        track_confirm_window=int(app.get("track_confirm_window", 5)),
+        track_buffer=int(app.get("track_buffer", 15)),
+        track_match_dist=float(app.get("track_match_dist", 0.06)),
         dashboard=DashboardConfig(
             columns=str(dashboard.get("columns", "auto")),
             show_events=bool(dashboard.get("show_events", True)),
@@ -323,6 +491,16 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "auto_capture_max": config.auto_capture_max,
             "detection_enabled": config.detection_enabled,
             "inference_cooldown": config.inference_cooldown,
+            "ai_enhance": config.ai_enhance,
+            "color_buoy_radar": config.color_buoy_radar,
+            "color_buoy_threshold": config.color_buoy_threshold,
+            "color_buoy_max": config.color_buoy_max,
+            "track_start_conf": config.track_start_conf,
+            "track_keep_conf": config.track_keep_conf,
+            "track_confirm_hits": config.track_confirm_hits,
+            "track_confirm_window": config.track_confirm_window,
+            "track_buffer": config.track_buffer,
+            "track_match_dist": config.track_match_dist,
         },
         "dashboard": {
             "columns": config.dashboard.columns,
@@ -339,6 +517,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
                 "name": camera.name,
                 "source": camera.source,
                 "enabled": camera.enabled,
+                "detect": camera.detect,
                 "allowed_classes": camera.allowed_classes or [],
                 "ignore_zones": camera.ignore_zones,
                 "ignore_polygons": camera.ignore_polygons or [],
@@ -449,6 +628,12 @@ class CameraWorker:
         self.frame_index = 0
         self.last_auto_capture = 0.0
         self.infer_input: Optional[Any] = None  # newest frame for the inference thread
+        self._infer_iter = 0  # inference loop counter (drives profile rotation + tracker steps)
+        self.tracker = ObjectTracker(
+            start_conf=app.track_start_conf, keep_conf=app.track_keep_conf,
+            confirm_hits=app.track_confirm_hits, confirm_window=app.track_confirm_window,
+            buffer_frames=app.track_buffer, match_dist=app.track_match_dist,
+        )
         self.thread = threading.Thread(target=self.run, name=f"camera-{camera.camera_id}", daemon=True)
         self.infer_thread = threading.Thread(target=self.run_inference, name=f"infer-{camera.camera_id}", daemon=True)
 
@@ -472,6 +657,7 @@ class CameraWorker:
                 "name": self.camera.name,
                 "source": masked_source(self.camera.source),
                 "status": self.status,
+                "detect": self.camera.detect,
                 "frame_index": self.frame_index,
                 "events": self.latest_events[-10:],
                 "detections": detections,
@@ -575,10 +761,15 @@ class CameraWorker:
         """Inference path: continuously analyse the newest frame, at whatever
         speed the hardware allows, without blocking the live video."""
         while not self.stop_event.is_set():
-            if self.detect_flag is not None and not self.detect_flag.is_set():
+            # AI is paused for this feed if either the global toggle is off OR this
+            # camera's own AI toggle is off.
+            global_off = self.detect_flag is not None and not self.detect_flag.is_set()
+            if global_off or not self.camera.detect:
                 with self.lock:
                     if self.latest_events:
                         self.latest_events = []
+                if self.tracker.tracks:
+                    self.tracker.tracks = []  # reset so it doesn't resume mid-track
                 time.sleep(0.1)
                 continue
             with self.lock:
@@ -586,11 +777,17 @@ class CameraWorker:
             if frame is None:
                 time.sleep(0.03)
                 continue
+            self._infer_iter += 1
+            # AI-only enhancement: YOLO sees an auto-levelled, condition-tuned copy
+            # (profile rotates each pass); the operator's video is the raw frame.
+            infer_frame = self.enhance_for_ai(frame) if self.app.ai_enhance else frame
             try:
                 with self.model_lock:
+                    # Detect at the LOW (keep) threshold so the tracker can sustain
+                    # faint objects; the tracker's hysteresis gates what becomes a track.
                     result = self.model.predict(
-                        frame,
-                        conf=self.app.confidence_threshold,
+                        infer_frame,
+                        conf=min(self.app.confidence_threshold, self.app.track_keep_conf),
                         iou=self.app.iou_threshold,
                         imgsz=self.app.image_size,
                         device=self.app.device,
@@ -600,9 +797,14 @@ class CameraWorker:
                 print(f"inference error ({self.camera.camera_id}): {exc}")
                 time.sleep(0.5)
                 continue
-            events = self.events_from_result(result)
+            # Gather this pass's raw detections from both sources, then let the tracker
+            # confirm/hold/coast them (stable IDs, hysteresis, occlusion tolerance).
+            dets = self.events_from_result(result)
+            if self.app.color_buoy_radar:
+                dets.extend(self.color_buoy_candidates(frame, dets))
             if self.app.demo_findings:
-                events.extend(self.demo_maritime_events(result.orig_img, len(events)))
+                dets.extend(self.demo_maritime_events(result.orig_img, len(dets)))
+            events = self.tracker.update(dets, self._infer_iter)
             self.event_writer.write_many(events)
             with self.lock:
                 self.latest_events = events
@@ -611,6 +813,101 @@ class CameraWorker:
             cooldown = getattr(self.app, "inference_cooldown", 0.25)
             if cooldown > 0:
                 time.sleep(cooldown)
+
+    def current_enhance_profile(self) -> str:
+        """The profile this inference pass uses. Rotates per pass so that across one
+        cycle the AI has viewed the scene under day / low-light / anti-glare / haze-rain."""
+        return ENHANCE_PROFILES[self._infer_iter % len(ENHANCE_PROFILES)]
+
+    def enhance_for_ai(self, frame: Any) -> Any:
+        """Return an AI-only enhanced copy of the frame using the current rotating
+        profile (auto-level + condition-tuned boost) so no single fixed setting can
+        blind the AI in sun/dusk/rain/haze. NEVER shown to the operator (the display
+        path uses the raw frame); this feeds inference only."""
+        try:
+            return enhance_for_profile(frame, self.current_enhance_profile())
+        except Exception:
+            return frame  # never break inference over an enhancement hiccup
+
+    def color_buoy_candidates(self, frame: Any, yolo_events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Colour-saliency 'buoy radar': per-frame candidate blobs of vivid red/green/
+        yellow on the water (where YOLO is weak on distant seamarks). Returns raw
+        detection events for THIS frame only — the shared ObjectTracker applies the
+        persistence/hysteresis so glint and noise don't trigger alerts. Runs on the RAW
+        frame for true colour; results become markers on the clean video."""
+        allowed = set(self.camera.allowed_classes or [])
+        if allowed and "navigation_buoy" not in allowed:
+            return []
+
+        height, width = frame.shape[:2]
+        b, g, r = cv2.split(frame.astype(np.int16))
+        redness = r - np.maximum(g, b)
+        greenness = g - np.maximum(r, b)
+        yellowness = np.minimum(r, g) - b
+        colorful = np.clip(np.maximum.reduce([redness, greenness, yellowness]), 0, 255).astype(np.uint8)
+        # Top-hat keeps small LOCAL colour peaks (buoys) and removes broad texture/
+        # gradients (water sheen, moiré from filming a screen) — a buoy is a dot, not a wash.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        colorful = cv2.morphologyEx(colorful, cv2.MORPH_TOPHAT, kernel)
+        # Only look at the open-water band: skip sky/land (top) and own deck (bottom).
+        band = np.zeros((height, width), np.uint8)
+        band[int(0.28 * height):int(0.80 * height), :] = 255
+        mask = cv2.bitwise_and((colorful > self.app.color_buoy_threshold).astype(np.uint8) * 255, band)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        def in_yolo_box(cx: float, cy: float) -> bool:
+            for ev in yolo_events:
+                bb = ev["bbox_xyxy"]
+                if bb["x1"] <= cx <= bb["x2"] and bb["y1"] <= cy <= bb["y2"]:
+                    return True
+            return False
+
+        detections = []
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            if w > 200 or h > 200 or w * h < 4:  # buoys are small, not big colour washes
+                continue
+            cx, cy = x + w / 2.0, y + h / 2.0
+            if in_yolo_box(cx, cy):  # already named by the net
+                continue
+            peak = int(colorful[y:y + h, x:x + w].max())
+            detections.append((cx, cy, w, h, peak))
+        # Keep only the strongest few candidates per frame so noise can't flood the view.
+        detections.sort(key=lambda d: -d[4])
+        detections = detections[: max(1, self.app.color_buoy_max)]
+
+        events = []
+        for cx, cy, w, h, peak in detections:
+            x1 = max(0.0, cx - w / 2.0)
+            y1 = max(0.0, cy - h / 2.0)
+            x2 = min(float(width), cx + w / 2.0)
+            y2 = min(float(height), cy + h / 2.0)
+            if self.is_ignored(x1, y1, x2, y2, width, height):
+                continue
+            confidence = min(0.95, 0.5 + peak / 30.0)  # colour strength → pseudo-confidence
+            events.append(
+                {
+                    "schema_version": "boat_vision.detection.v1",
+                    "event_type": "object_detection",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "camera_id": self.camera.camera_id,
+                    "source": masked_source(self.camera.source),
+                    "frame_index": self.frame_index,
+                    "video_time_sec": None,
+                    "model": f"{self.active_model}+color",
+                    "class_id": 2000,
+                    "class_name": "navigation_buoy",
+                    "confidence": float(confidence),
+                    "tracking_id": None,
+                    "bbox_xyxy": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "bbox_xywh": {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1},
+                    "image_size": {"width": int(width), "height": int(height)},
+                    "vessel_pose": None,
+                    "color_radar": True,
+                }
+            )
+        return events
 
     def maybe_auto_capture(self) -> None:
         """Passively save a clean frame every N seconds while running, for later labeling."""
@@ -939,6 +1236,22 @@ class DashboardState:
             save_config(self.config_path, self.config)
         return enabled
 
+    def set_camera_detection(self, camera_id: str, enabled: bool) -> Optional[bool]:
+        """Toggle AI for a single feed (independent of the global toggle)."""
+        with self.lock:
+            found = False
+            for camera in self.config.cameras:
+                if camera.camera_id == camera_id:
+                    camera.detect = enabled
+                    found = True
+            if not found:
+                return None
+            worker = self.workers.get(camera_id)
+            if worker is not None:
+                worker.camera.detect = enabled  # live effect without a restart
+            save_config(self.config_path, self.config)
+        return enabled
+
     def start_workers(self) -> None:
         self.workers = {
             camera.camera_id: CameraWorker(
@@ -992,6 +1305,7 @@ class DashboardState:
                     "name": camera.name,
                     "source": masked_source(camera.source),
                     "status": "disabled",
+                    "detect": camera.detect,
                     "frame_index": 0,
                     "events": [],
                     "has_frame": False,
@@ -1084,8 +1398,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
                 enabled = bool(payload.get("enabled", True))
+                camera_id = payload.get("camera_id")
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if camera_id:  # per-feed toggle
+                result = self.state().set_camera_detection(str(camera_id), enabled)
+                if result is None:
+                    self.send_json({"ok": False, "error": "unknown camera_id"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self.send_json({"ok": True, "camera_id": camera_id, "detect": enabled})
                 return
             self.state().set_detection(enabled)
             self.send_json({"ok": True, "detection_enabled": enabled})
@@ -1549,15 +1871,29 @@ DASHBOARD_HTML = r"""<!doctype html>
       color: #0f8a5f; font-weight: 600; backdrop-filter: blur(14px) saturate(1.2); box-shadow: 0 4px 16px rgba(8,15,22,0.18); }
     .camera-header .status.disabled { color: #64748b; }
     .camera-header .status.error { color: #c0392b; }
+    .camera-header h2 { margin-right: auto; }
+    .cam-ai { pointer-events: auto; cursor: pointer; font-size: 12px; font-weight: 600; color: #0e1a24;
+      padding: 6px 11px; border-radius: 999px; background: rgba(255,255,255,0.82);
+      border: 1px solid rgba(255,255,255,0.7); backdrop-filter: blur(14px) saturate(1.2);
+      box-shadow: 0 4px 16px rgba(8,15,22,0.18); display: inline-flex; align-items: center; gap: 6px; }
+    .cam-ai:hover { background: rgba(255,255,255,0.95); }
+    .cam-ai .fa-brain { color: var(--ok); }
+    .cam-ai.off { color: var(--danger); }
+    .cam-ai.off .fa-brain { color: var(--danger); opacity: 0.85; }
     .camera pre.events, pre.events { display: none !important; }
     .app.focused #camera-grid { grid-template-columns: 1fr !important; grid-auto-rows: 1fr; }
     .app.focused .camera { display: none; }
     .app.focused .camera.focused { display: flex; }
 
-    /* Floating top bar — light, classy glass to match the reference */
+    /* Floating top bar — light, classy glass to match the reference.
+       Auto-hides: only visible when the cursor is near the top of the screen, so
+       the controls stay out of the way of the live video. */
     .topbar { position: fixed; z-index: 30; top: 16px; left: 16px; right: 16px; height: 48px;
-      display: flex; align-items: center; justify-content: space-between; pointer-events: none; }
+      display: flex; align-items: center; justify-content: space-between; pointer-events: none;
+      transition: opacity 220ms ease, transform 260ms cubic-bezier(.4,0,.2,1); }
     .topbar > * { pointer-events: auto; }
+    .topbar.hidden { opacity: 0; transform: translateY(-135%); }
+    .topbar.hidden > * { pointer-events: none; }
     .tb-brand { display: flex; align-items: center; gap: 11px; padding: 7px 16px 7px 8px;
       background: rgba(255,255,255,0.82); border: 1px solid rgba(255,255,255,0.7); border-radius: 999px;
       backdrop-filter: blur(14px) saturate(1.2); box-shadow: 0 4px 16px rgba(8,15,22,0.18); color: #0e1a24; }
@@ -1858,12 +2194,34 @@ DASHBOARD_HTML = r"""<!doctype html>
             <div class="camera-header">
               <h2></h2>
               <span class="status"></span>
+              <button class="cam-ai" title="Turn AI on/off for this feed"><i class="fa-solid fa-brain"></i> <span class="cam-ai-label">AI</span></button>
             </div>
             <img alt="">
             <div class="overlay"></div>
             <pre class="events"></pre>
           `;
-          section.addEventListener('click', () => toggleFocus(camera.camera_id));
+          section.addEventListener('click', (e) => {
+            if (e.target.closest('.cam-ai')) return;  // let the AI toggle handle itself
+            toggleFocus(camera.camera_id);
+          });
+          const aiBtn = section.querySelector('.cam-ai');
+          aiBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const enable = aiBtn.classList.contains('off');  // off -> turn on
+            aiBtn.classList.toggle('off', !enable);          // optimistic
+            try {
+              const res = await fetch('/detection.json', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({camera_id: camera.camera_id, enabled: enable}),
+              });
+              const r = await res.json();
+              aiBtn.classList.toggle('off', !r.detect);
+              // keep the in-memory config in sync so a later Settings save won't revert it
+              const cc = ((config && config.cameras) || []).find((c) => c.camera_id === camera.camera_id);
+              if (cc) cc.detect = r.detect;
+              showToast(`AI ${r.detect ? 'on' : 'off'} · ${camera.name || camera.camera_id}`);
+            } catch (err) { aiBtn.classList.toggle('off', enable); }
+          });
           grid.appendChild(section);
         }
       }
@@ -1961,6 +2319,11 @@ DASHBOARD_HTML = r"""<!doctype html>
         const statusNode = card.querySelector('.status');
         statusNode.textContent = `${camera.status} · frame ${camera.frame_index}`;
         statusNode.className = `status ${camera.status === 'disabled' ? 'disabled' : ''} ${camera.status.includes('error') ? 'error' : ''}`;
+        const aiBtn = card.querySelector('.cam-ai');
+        if (aiBtn) {
+          aiBtn.classList.toggle('off', camera.detect === false);
+          aiBtn.querySelector('.cam-ai-label').textContent = camera.detect === false ? 'AI off' : 'AI';
+        }
         const img = card.querySelector('img');
         if (camera.status !== 'disabled') {
           liveCameras.add(camera.camera_id);
@@ -2084,9 +2447,13 @@ DASHBOARD_HTML = r"""<!doctype html>
       config.cameras = [...document.querySelectorAll('.camera-config')].map((node) => {
         let polys = [];
         try { polys = JSON.parse(node.querySelector('.camera-polygons').value || '[]'); } catch (e) {}
+        const cid = node.querySelector('.camera-id').value.trim();
+        const prev = (config.cameras || []).find((c) => c.camera_id === cid);
         return {
           enabled: node.querySelector('.camera-enabled').checked,
-          camera_id: node.querySelector('.camera-id').value.trim(),
+          // preserve the per-feed AI toggle (set from the camera card, not this form)
+          detect: prev ? prev.detect !== false : true,
+          camera_id: cid,
           name: node.querySelector('.camera-name').value.trim(),
           source: node.querySelector('.camera-source').value.trim(),
           allowed_classes: node.querySelector('.camera-classes').value.split(',').map((item) => item.trim()).filter(Boolean),
@@ -2301,6 +2668,40 @@ DASHBOARD_HTML = r"""<!doctype html>
     });
     $('settings-close').addEventListener('click', () => setSettingsOpen(false));
     $('settings-scrim').addEventListener('click', () => setSettingsOpen(false));
+
+    // ---- Auto-hide top bar: reveal only when the cursor is in the top 20% ----
+    (function () {
+      const bar = document.querySelector('.topbar');
+      if (!bar) return;
+      const REVEAL_BAND = 0.20;   // top fraction of the window that reveals the bar
+      const HIDE_DELAY = 1500;    // ms without qualifying input before it tucks away
+      let hideTimer = null;
+      const pinned = () =>
+        $('settings').classList.contains('open') ||
+        $('display-pop').classList.contains('open') ||
+        bar.matches(':hover');
+      function show() {
+        bar.classList.remove('hidden');
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      }
+      function scheduleHide() {
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = setTimeout(() => { if (!pinned()) bar.classList.add('hidden'); }, HIDE_DELAY);
+      }
+      window.addEventListener('mousemove', (e) => {
+        if (e.clientY <= window.innerHeight * REVEAL_BAND) show();
+        else if (!pinned()) scheduleHide();
+      });
+      bar.addEventListener('mouseenter', show);
+      bar.addEventListener('mouseleave', scheduleHide);
+      window.addEventListener('touchstart', (e) => {
+        const y = (e.touches && e.touches[0]) ? e.touches[0].clientY : 1e9;
+        if (y <= window.innerHeight * REVEAL_BAND) { show(); scheduleHide(); }
+      }, { passive: true });
+      // Reveal briefly on load so the controls are discoverable, then tuck away.
+      show();
+      scheduleHide();
+    })();
     for (const id of ['columns', 'card-min-width', 'show-labels', 'show-status', 'show-events', 'start-wall-mode']) {
       $(id).addEventListener('change', () => {
         collectConfig();

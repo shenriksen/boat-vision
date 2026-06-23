@@ -17,6 +17,20 @@ app:
   auto_capture: false
   auto_capture_interval: 10
   auto_capture_max: 500
+  # AI-only image processing (the operator always sees the clean, raw video).
+  ai_enhance: true          # auto-level exposure + rotate day/low-light/anti-glare/haze
+                            # profiles so changing weather/light can't blind the AI
+  color_buoy_radar: true    # flag vivid red/green/yellow blobs on the water as buoys
+  color_buoy_threshold: 12  # min local colour-contrast to count (lower = more sensitive)
+  color_buoy_max: 6         # keep only the N strongest colour candidates per frame
+  # Tracking with confidence hysteresis — stable live detection (no flicker, holds
+  # through brief occlusions). High bar to start a track, low bar to keep it.
+  track_start_conf: 0.60    # confidence needed to START a new track
+  track_keep_conf: 0.35     # confidence needed to SUSTAIN an existing track
+  track_confirm_hits: 3     # seen in N of last `track_confirm_window` passes before alarm
+  track_confirm_window: 5
+  track_buffer: 15          # keep coasting a lost track this many passes (occlusion)
+  track_match_dist: 0.06    # max centre move to match a track (fraction of frame width)
 
 dashboard:
   columns: "2"

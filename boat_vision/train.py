@@ -2,12 +2,35 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
 import torch
+import yaml
 from ultralytics import YOLO
+
+
+def resolve_data(data_path: str) -> str:
+    """Resolve a dataset YAML's relative `path` to an absolute one against the current
+    working directory (the train scripts cd to the repo root). This lets the configs
+    stay machine-independent — Ultralytics otherwise resolves a relative `path` against
+    its own datasets_dir, not the repo. Returns a temp YAML when rewriting is needed."""
+    src = Path(data_path)
+    if not src.exists():
+        return data_path
+    try:
+        doc = yaml.safe_load(src.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return data_path
+    ds = doc.get("path")
+    if not ds or Path(ds).is_absolute():
+        return data_path
+    doc["path"] = str((Path.cwd() / ds).resolve())
+    fd, tmp = tempfile.mkstemp(prefix="bv_data_", suffix=".yaml")
+    Path(tmp).write_text(yaml.safe_dump(doc), encoding="utf-8")
+    return tmp
 
 
 def pick_device(requested: str) -> str:
@@ -72,7 +95,7 @@ def main() -> int:
 
     model = YOLO(args.model)
     results = model.train(
-        data=args.data,
+        data=resolve_data(args.data),
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch=batch,

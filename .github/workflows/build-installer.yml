@@ -32,6 +32,9 @@ jobs:
           pip install -r requirements.txt
           pip install pywebview pyinstaller
 
+      - name: Fetch base model weights (gitignored, needed by --add-data)
+        run: python scripts/fetch_models.py
+
       - name: Build folder app (onedir)
         shell: pwsh
         run: |
